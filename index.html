@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Threesometric med Anpassad Navigation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #22223b; cursor: crosshair; }
+        canvas { display: block; }
+        #virtual-cursor {
+            position: fixed;
+            width: 12px;
+            height: 12px;
+            border: 2px solid white;
+            border-radius: 50%;
+            pointer-events: none; /* Mycket viktigt! */
+            transform: translate(-50%, -50%);
+            display: none;
+            z-index: 9999;
+            box-sizing: border-box;
+        }
+    </style>
+</head>
+<body>
+    <div id="virtual-cursor"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        // Importera Three.js och nödvändiga moduler
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+        // =============================================================================
+        // === GLOBALA VARIABLER & KONSTANTER
+        // =============================================================================
+
+        // Scen-objekt
+        const scene = new THREE.Scene();
+        const camera = new THREE.OrthographicCamera(-5, 5, 5, -5, 1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        const controls = new OrbitControls(camera, renderer.domElement);
+        const raycaster = new THREE.Raycaster();
+
+        // Rit-tillstånd
+        let isDrawing = false;
+        let lineStartPoint = new THREE.Vector3();
+        let startMousePos = new THREE.Vector2();
+        // NYTT: Tillstånd för anpassad navigering
+        let isPanning = false;
+        let isOrbiting = false;
+
+        // Variabler för Pointer Lock och virtuell pekare
+        let virtualCursor = null; 
+        const virtualMousePos = new THREE.Vector2();
+        
+        // Hjälp-objekt
+        const VEC3_ZERO = new THREE.Vector3(0, 0, 0);
+        const defaultCameraPosition = new THREE.Vector3(50, 50, 50);
+        const loopPreviewPlane = new THREE.Plane();
+        const loopPlaneNormal = new THREE.Vector3();
+        const loopFreeEndPoint = new THREE.Vector3();
+        const loopLocalRay = new THREE.Ray();
+        const loopWorldFreeEndPoint = new THREE.Vector3();
+        const loopLookAtTarget = new THREE.Vector3();
+
+        // Minne för "enda källan till sanning"
+        let lastPreviewedDirection = new THREE.Vector3();
+        let lastPreviewedEndPoint = new THREE.Vector3();
+
+        // Mus-koordinater
+        const mouse = new THREE.Vector2();
+
+        // Scen-innehåll
+        const permanentLines = [];
+        const permanentVertices = new THREE.Group();
+        const previewLine = new THREE.Line(
+            new THREE.BufferGeometry().setFromPoints([VEC3_ZERO, VEC3_ZERO]),
+            new THREE.LineBasicMaterial({ color: 0xffffff })
+        );
+        const planeMesh = new THREE.Mesh(
+            new THREE.PlaneGeometry(100, 100),
+            new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide })
+        );
+        const marker = new THREE.Mesh(
+            new THREE.SphereGeometry(0.2, 16, 8),
+            new THREE.MeshBasicMaterial({ color: 0xffffff })
+        );
+        const dynamicHelperPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(20, 20),
+            new THREE.MeshBasicMaterial({
+                color: 0x00ffff,
+                side: THREE.DoubleSide,
+                transparent: true,
+                opacity: 0.15
+            })
+        );
+        dynamicHelperPlane.material.depthTest = false;
+
+        // =============================================================================
+        // === INITIALISERING
+        // =============================================================================
+
+        function init() {
+            scene.background = new THREE.Color(0x22223b);
+            onWindowResize();
+            camera.position.copy(defaultCameraPosition);
+            camera.lookAt(VEC3_ZERO);
+            scene.add(camera);
+
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            controls.enableRotate = false;
+            controls.mouseButtons = { MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.DOLLY, LEFT: null };
+
+            const gridHelper = new THREE.GridHelper(100, 100, 0x444444, 0x888888);
+            scene.add(gridHelper);
+            
+            planeMesh.rotation.x = -Math.PI / 2;
+            scene.add(planeMesh);
+            
+            scene.add(marker);
+            
+            previewLine.visible = false;
+            scene.add(previewLine);
+            
+            dynamicHelperPlane.visible = false;
+            scene.add(dynamicHelperPlane);
+            
+            scene.add(permanentVertices);
+
+            renderer.domElement.addEventListener('mousemove', onMouseMove, false);
+            renderer.domElement.addEventListener('pointerdown', onPointerDown, true);
+            // NYTT: Lyssnare för att släppa panoreringsknappen
+            renderer.domElement.addEventListener('pointerup', onPointerUp, false);
+            renderer.domElement.addEventListener('click', onClick, false);
+            // NYTT: Lyssnare för scrollhjulet
+            renderer.domElement.addEventListener('wheel', onWheel, false);
+
+            window.addEventListener('keydown', onKeyDown, false);
+            window.addEventListener('keyup', onKeyUp, false);
+            window.addEventListener('resize', onWindowResize, false);
+            
+            virtualCursor = document.getElementById('virtual-cursor');
+            document.addEventListener('pointerlockchange', onPointerLockChange, false);
+            
+            animate();
+            console.log("threesometric initierad!");
+        }
+
+        function onPointerLockChange() {
+            if (document.pointerLockElement === renderer.domElement) {
+                controls.enabled = false;
+                virtualCursor.style.display = 'block';
+                if (isDrawing) {
+                    recalibrateVirtualMouse();
+                }
+            } else {
+                controls.enabled = true;
+                virtualCursor.style.display = 'none';
+                isDrawing = false;
+                isPanning = false;
+                isOrbiting = false;
+                previewLine.visible = false;
+                dynamicHelperPlane.visible = false;
+            }
+        }
+        
+        function recalibrateVirtualMouse() {
+            const snappedScreenPos = new THREE.Vector3();
+            snappedScreenPos.copy(lineStartPoint).project(camera);
+
+            startMousePos.set(snappedScreenPos.x, snappedScreenPos.y);
+            virtualMousePos.copy(startMousePos);
+
+            const pixelX = (virtualMousePos.x + 1) / 2 * window.innerWidth;
+            const pixelY = (-virtualMousePos.y + 1) / 2 * window.innerHeight;
+            virtualCursor.style.left = `${pixelX}px`;
+            virtualCursor.style.top = `${pixelY}px`;
+        }
+
+        // =============================================================================
+        // === HJÄLPFUNKTIONER (Oförändrade)
+        // =============================================================================
+
+        function snapAngle(angle) {
+            const normalizedAngle = (angle + 360) % 360;
+            const isoAngles = [30, 90, 150, 210, 270, 330];
+            return isoAngles.reduce((prev, curr) => {
+                const diffToPrev = Math.min(Math.abs(normalizedAngle - prev), 360 - Math.abs(normalizedAngle - prev));
+                const diffToCurr = Math.min(Math.abs(normalizedAngle - curr), 360 - Math.abs(normalizedAngle - curr));
+                return diffToCurr < diffToPrev ? curr : prev;
+            });
+        }
+
+        function getDirectionFromAngle(angle) {
+            const directions = {
+                330: new THREE.Vector3(1, 0, 0), 30:  new THREE.Vector3(0, 0, -1), 90:  new THREE.Vector3(0, 1, 0),
+                150: new THREE.Vector3(-1, 0, 0), 210: new THREE.Vector3(0, 0, 1), 270: new THREE.Vector3(0, -1, 0)
+            };
+            return directions[angle];
+        }
+
+        // =============================================================================
+        // === EVENT-HANTERARE
+        // =============================================================================
+
+        function onMouseMove(event) {
+            if (document.pointerLockElement === renderer.domElement) {
+                // Om vi panorerar, flytta kameran
+                if (isPanning) {
+                    const panSpeed = (camera.right - camera.left) / camera.zoom / renderer.domElement.clientWidth;
+                    const deltaX = -event.movementX * panSpeed;
+                    const deltaY = event.movementY * panSpeed;
+                    
+                    const panOffset = new THREE.Vector3();
+                    panOffset.set(deltaX, deltaY, 0);
+                    panOffset.applyQuaternion(camera.quaternion);
+
+                    camera.position.add(panOffset);
+                    controls.target.add(panOffset); // Flytta även kontrollernas mål
+                    recalibrateVirtualMouse();
+                    return; // Stoppa här så vi inte rör den virtuella pekaren
+                }
+                
+                // Om vi orbiterar, rotera kameran
+                if (isOrbiting) {
+                    const orbitSpeed = 0.01;
+                    camera.position.sub(controls.target); // Flytta till origo relativt målet
+                    const spherical = new THREE.Spherical().setFromVector3(camera.position);
+                    spherical.theta -= event.movementX * orbitSpeed;
+                    spherical.phi -= event.movementY * orbitSpeed;
+                    spherical.phi = Math.max(0.1, Math.min(Math.PI - 0.1, spherical.phi)); // Begränsa polär vinkel
+                    camera.position.setFromSpherical(spherical);
+                    camera.position.add(controls.target); // Flytta tillbaka
+                    camera.lookAt(controls.target);
+                    recalibrateVirtualMouse();
+                    return;
+                }
+
+                // Annars, flytta den virtuella pekaren för att rita
+                const newX = virtualMousePos.x + (event.movementX / window.innerWidth) * 2;
+                const newY = virtualMousePos.y - (event.movementY / window.innerHeight) * 2;
+                virtualMousePos.x = Math.max(-1, Math.min(1, newX));
+                virtualMousePos.y = Math.max(-1, Math.min(1, newY));
+                const pixelX = (virtualMousePos.x + 1) / 2 * window.innerWidth;
+                const pixelY = (-virtualMousePos.y + 1) / 2 * window.innerHeight;
+                virtualCursor.style.left = `${pixelX}px`;
+                virtualCursor.style.top = `${pixelY}px`;
+            } else {
+                mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+                mouse.y = - (event.clientY / window.innerHeight) * 2 + 1;
+            }
+        }
+
+        function onPointerDown(event) {
+            // Om vi är i låst läge, hantera mittenklick för panorering
+            if (document.pointerLockElement) {
+                if (event.button === 1) { // Mittenmusknapp
+                    isPanning = true;
+                }
+                return;
+            }
+
+            // Annars, starta en ny rit-operation med vänsterklick
+            if (event.button !== 0) return;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(planeMesh);
+            
+            if (intersects.length > 0) {
+                event.stopImmediatePropagation();
+                isDrawing = true;
+                lineStartPoint.copy(intersects[0].point);
+                const startVertex = new THREE.Mesh( new THREE.SphereGeometry(0.1, 16, 8), new THREE.MeshBasicMaterial({ color: 0xff0000 }));
+                startVertex.position.copy(lineStartPoint);
+                permanentVertices.add(startVertex);
+                renderer.domElement.requestPointerLock();
+            }
+        }
+        
+        // NYTT: Hanterar uppsläpp av panoreringsknappen
+        function onPointerUp(event) {
+            if (event.button === 1) {
+                isPanning = false;
+            }
+        }
+
+        function onClick(event) {
+            if (event.button !== 0 || !isDrawing || !document.pointerLockElement) return;
+            if (isPanning || isOrbiting) return; // Placera inte noder om vi navigerar
+            if (!previewLine.visible) return;
+
+            const direction3D = lastPreviewedDirection;
+            const freeEndPoint = lastPreviewedEndPoint;
+            const vectorFromStart = new THREE.Vector3().subVectors(freeEndPoint, lineStartPoint);
+            const projectedVector = vectorFromStart.projectOnVector(direction3D);
+            const finalEndPoint = new THREE.Vector3().addVectors(lineStartPoint, projectedVector);
+
+            if (lineStartPoint.distanceTo(finalEndPoint) < 0.1) return; 
+
+            const newGeometry = new THREE.BufferGeometry().setFromPoints([lineStartPoint, finalEndPoint]);
+            const permanentLine = new THREE.Line(newGeometry, new THREE.LineBasicMaterial({ color: 0xffffff }));
+            scene.add(permanentLine);
+            permanentLines.push(permanentLine);
+
+            const endVertex = new THREE.Mesh( new THREE.SphereGeometry(0.1, 16, 8), new THREE.MeshBasicMaterial({ color: 0xff0000 }));
+            endVertex.position.copy(finalEndPoint);
+            permanentVertices.add(endVertex);
+
+            lineStartPoint.copy(finalEndPoint);
+            recalibrateVirtualMouse();
+        }
+        
+        // NYTT: Hanterar zoomning med scrollhjulet
+        function onWheel(event) {
+            if (!document.pointerLockElement) return;
+            event.preventDefault();
+
+            const zoomSpeed = 0.1;
+            const zoomFactor = event.deltaY > 0 ? (1 - zoomSpeed) : (1 + zoomSpeed);
+            
+            camera.zoom *= zoomFactor;
+            camera.zoom = Math.max(0.1, Math.min(camera.zoom, 10)); // Begränsa zoom
+            camera.updateProjectionMatrix();
+            recalibrateVirtualMouse();
+        }
+
+        function onKeyDown(event) {
+            if (event.key === 'Control' && document.pointerLockElement) {
+                isOrbiting = true;
+            }
+        }
+
+        function onKeyUp(event) {
+            if (event.code === 'Escape') {
+                if (document.pointerLockElement) {
+                    document.exitPointerLock();
+                }
+            }
+            if (event.key === 'Control') {
+                if (isOrbiting) {
+                    isOrbiting = false;
+                    // Återställ kameran till standardpositionen
+                    camera.position.copy(defaultCameraPosition);
+                    camera.lookAt(controls.target); // Titta på samma mål som innan
+                    recalibrateVirtualMouse();
+                }
+            }
+        }
+
+        function onWindowResize() {
+            const aspectRatio = window.innerWidth / window.innerHeight;
+            const frustumSize = 20;
+            camera.left = -frustumSize * aspectRatio / 2;
+            camera.right = frustumSize * aspectRatio / 2;
+            camera.top = frustumSize / 2;
+            camera.bottom = -frustumSize / 2;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            if(isDrawing && document.pointerLockElement) {
+                recalibrateVirtualMouse();
+            }
+        }
+
+        // =============================================================================
+        // === ANIMATIONSLOOP
+        // =============================================================================
+
+        function animate() {
+            requestAnimationFrame(animate);
+            if (controls.enabled) {
+                controls.update();
+            }
+            
+            const currentMouse = document.pointerLockElement ? virtualMousePos : mouse;
+            raycaster.setFromCamera(currentMouse, camera);
+
+            if (isDrawing && document.pointerLockElement && !isPanning && !isOrbiting) {
+                const dragDistance = virtualMousePos.distanceTo(startMousePos);
+                const startThreshold = 0.01;
+
+                if (dragDistance > startThreshold) {
+                    previewLine.visible = true;
+                    dynamicHelperPlane.visible = true;
+
+                    const rawAngle = Math.atan2(virtualMousePos.y - startMousePos.y, virtualMousePos.x - startMousePos.x) * 180 / Math.PI;
+                    const snappedAngle = snapAngle(rawAngle);
+                    const direction3D = getDirectionFromAngle(snappedAngle);
+
+                    if (direction3D) {
+                        if (Math.abs(direction3D.y) === 1.0) { loopPlaneNormal.set(1, 0, 0); } 
+                        else { loopPlaneNormal.set(0, 1, 0); }
+                        
+                        loopPreviewPlane.setFromNormalAndCoplanarPoint(loopPlaneNormal, VEC3_ZERO);
+                        loopLocalRay.copy(raycaster.ray).origin.sub(lineStartPoint);
+
+                        if (loopLocalRay.intersectPlane(loopPreviewPlane, loopFreeEndPoint)) {
+                            loopWorldFreeEndPoint.copy(loopFreeEndPoint).add(lineStartPoint);
+                            const positions = previewLine.geometry.attributes.position;
+                            positions.setXYZ(0, lineStartPoint.x, lineStartPoint.y, lineStartPoint.z);
+                            positions.setXYZ(1, loopWorldFreeEndPoint.x, loopWorldFreeEndPoint.y, loopWorldFreeEndPoint.z);
+                            positions.needsUpdate = true;
+                            marker.position.copy(loopWorldFreeEndPoint);
+                            lastPreviewedDirection.copy(direction3D);
+                            lastPreviewedEndPoint.copy(loopWorldFreeEndPoint);
+                            dynamicHelperPlane.position.copy(lineStartPoint);
+                            if (loopPlaneNormal.y === 1.0) { dynamicHelperPlane.up.set(0, 0, 1); } 
+                            else { dynamicHelperPlane.up.set(0, 1, 0); }
+                            dynamicHelperPlane.lookAt(loopLookAtTarget.copy(lineStartPoint).add(loopPlaneNormal));
+                        } else {
+                            previewLine.visible = false;
+                            dynamicHelperPlane.visible = false;
+                        }
+                    }
+                } else {
+                    previewLine.visible = false;
+                    dynamicHelperPlane.visible = false;
+                }
+            } else {
+                previewLine.visible = false;
+                dynamicHelperPlane.visible = false;
+                if (!isDrawing) {
+                    const intersects = raycaster.intersectObject(planeMesh);
+                    if (intersects.length > 0) {
+                        marker.position.copy(intersects[0].point);
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Kör igång allt
+        init();
+    </script>
+</body>
+</html>
