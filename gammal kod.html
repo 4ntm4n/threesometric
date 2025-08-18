@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Threesometric – Glasskiva → 3D med pan/zoom & snap vid commit + Frustum-visualisering</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; overflow: hidden; background-color: #22223b; cursor: crosshair; }
+    canvas { display: block; position: absolute; top: 0; left: 0; }
+    #virtual-cursor {
+      position: fixed;
+      width: 12px;
+      height: 12px;
+      border: 2px solid white;
+      border-radius: 50%;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      display: none;
+      z-index: 9999;
+      box-sizing: border-box;
+    }
+    #hud {
+      position: fixed; left: 8px; bottom: 8px; z-index: 10000;
+      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color:#ddd; opacity:.85; background: rgba(0,0,0,.25); padding:8px 10px; border-radius:8px;
+      backdrop-filter: blur(6px);
+    }
+    #hud kbd { background:#111; padding:1px 4px; border-radius:4px; border:1px solid #333; }
+  </style>
+</head>
+<body>
+  <div id="virtual-cursor"></div>
+  <div id="hud">
+    <div><strong>Ritläge:</strong> vänsterklick = start/commit, <kbd>Esc</kbd> = avsluta sekvens</div>
+    <div><strong>Pan:</strong> mellanknapp • <strong>Zoom:</strong> rullhjul • <strong>Dolly (höger-drag):</strong> på</div>
+    <div>Vinkel snäpps först vid commit (30°, 90°, 150°, 210°, 270°, 330°)</div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+
+  // =============================================================================
+  // 3D SCENE
+  // =============================================================================
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x22223b);
+
+  const frustumSize = 20;
+  const aspect = window.innerWidth / window.innerHeight;
+  const camera = new THREE.OrthographicCamera(
+    -frustumSize * aspect / 2,
+     frustumSize * aspect / 2,
+     frustumSize / 2,
+    -frustumSize / 2,
+    1,
+    4000
+  );
+  // Isometriskt: 45° runt Y, ~35.264° ner runt X → (50,50,50) tittar mot (0,0,0)
+  camera.position.set(50, 50, 50);
+  camera.lookAt(0,0,0);
+
+  const renderer3D = new THREE.WebGLRenderer({ antialias: true });
+  renderer3D.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer3D.domElement);
+
+  const controls = new OrbitControls(camera, renderer3D.domElement);
+  controls.enableRotate = false;
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }; // höger = dolly/rotate tillåtet enligt OrbitControls
+
+  // Grid (globalt XZ)
+  const gridHelper = new THREE.GridHelper(100, 100, 0x444444, 0x888888);
+  scene.add(gridHelper);
+
+  // Markör när vi inte ritar
+  const idleMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.2, 16, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  scene.add(idleMarker);
+
+  // "Pick"-plan för att sätta första startpunkten (syns inte)
+  const pickPlaneMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(100, 100),
+    new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide })
+  );
+  pickPlaneMesh.rotation.x = -Math.PI / 2; // XZ-plan vid y=0
+  scene.add(pickPlaneMesh);
+
+  const raycaster = new THREE.Raycaster();
+
+  // =============================================================================
+  // PREVIEW OVERLAY (2D GLASSKIVA)
+  // =============================================================================
+  const overlay = document.createElement('canvas');
+  overlay.width = window.innerWidth;
+  overlay.height = window.innerHeight;
+  overlay.style.pointerEvents = 'none'; // ritning via pointerlock på 3D canvas
+  document.body.appendChild(overlay);
+  const ctx = overlay.getContext('2d');
+
+  // =============================================================================
+  // STATE
+  // =============================================================================
+  let isDrawing = false;           // vi är i en pågående polyline-sekvens
+  let hasStart = false;            // har aktiv startpunkt
+  let lineStartPoint = new THREE.Vector3(); // 3D startpunkt
+  let start2D = { x: 0, y: 0 };    // projicerad 2D startpunkt (pixlar)
+
+  // Virtuell pekare (pixel-koordinater, ok att gå utanför fönster för intern beräkning)
+  const virtualCursorEl = document.getElementById('virtual-cursor');
+  let virtualCursorPix = { x: 0, y: 0 };
+
+  // För pan/orbit/zoom under pointerlock
+  let isPanning = false;
+  let isOrbiting = false;
+
+  // Spara linjer & vertices
+  const permanentLines = [];
+  const permanentVertices = new THREE.Group();
+  scene.add(permanentVertices);
+
+  function addVertexSphere(pos, color=0xff0000) {
+    const s = new THREE.Mesh(
+      new THREE.SphereGeometry(0.1, 16, 8),
+      new THREE.MeshBasicMaterial({ color })
+    );
+    s.position.copy(pos);
+    permanentVertices.add(s);
+  }
+
+  // =============================================================================
+  // HELPERS
+  // =============================================================================
+  function projectTo2D(v3) {
+    const v = v3.clone().project(camera);
+    return {
+      x: (v.x + 1) * 0.5 * overlay.width,
+      y: (-v.y + 1) * 0.5 * overlay.height
+    };
+  }
+
+  // Hur många pixlar motsvarar 1 world-unit i given 3D riktning från en given punkt?
+  function pixelsPerWorldUnit(dir3D, origin3D) {
+    const step = 1; // 1 world unit
+    const p0 = projectTo2D(origin3D);
+    const p1 = projectTo2D(origin3D.clone().add(dir3D.clone().normalize().multiplyScalar(step)));
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    const d = Math.hypot(dx, dy);
+    // säkerhetsnät
+    return d < 1e-6 ? 1e-6 : d;
+  }
+
+  const ISO_ANGLES = [30, 90, 150, 210, 270, 330];
+  // Samma mapping som du hade (viktigt): angle→3D
+  function angleToIsoDir3D(angleDeg) {
+    const dirs = {
+      330: new THREE.Vector3( 1,  0,  0),
+       30: new THREE.Vector3( 0,  0, -1),
+       90: new THREE.Vector3( 0,  1,  0),
+      150: new THREE.Vector3(-1,  0,  0),
+      210: new THREE.Vector3( 0,  0,  1),
+      270: new THREE.Vector3( 0, -1,  0),
+    };
+    return dirs[angleDeg].clone();
+  }
+
+  function snapAngleDeg(rawAngle) {
+    // rawAngle i grader, baserat på skärmens y nedåt (+)
+    const norm = ((rawAngle % 360) + 360) % 360;
+    let best = ISO_ANGLES[0];
+    let bestDiff = 1e9;
+    for (const a of ISO_ANGLES) {
+      const d = Math.min(Math.abs(norm - a), 360 - Math.abs(norm - a));
+      if (d < bestDiff) { bestDiff = d; best = a; }
+    }
+    return best;
+  }
+
+  function drawOverlay() {
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+
+    if (hasStart) {
+      // startpunkt markör i overlay
+      ctx.fillStyle = 'rgba(255,0,0,.9)';
+      ctx.beginPath();
+      ctx.arc(start2D.x, start2D.y, 3, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    if (hasStart && isDrawing) {
+      // fri "rubberband" preview – ingen snap här
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(start2D.x, start2D.y);
+      ctx.lineTo(virtualCursorPix.x, virtualCursorPix.y);
+      ctx.stroke();
+    }
+  }
+
+  function setVirtualCursorTo2D(pix) {
+    virtualCursorPix.x = pix.x;
+    virtualCursorPix.y = pix.y;
+    // visa ringen på skärmen men clamp:a för DOMens skull (intern position ändå kvar i virtualCursorPix)
+    const clampedX = Math.max(-9999, Math.min(window.innerWidth + 9999, pix.x));
+    const clampedY = Math.max(-9999, Math.min(window.innerHeight + 9999, pix.y));
+    virtualCursorEl.style.left = clampedX + 'px';
+    virtualCursorEl.style.top  = clampedY + 'px';
+  }
+
+  function recalibrateVirtualCursorToStart() {
+    start2D = projectTo2D(lineStartPoint);
+    setVirtualCursorTo2D({ x: start2D.x, y: start2D.y });
+  }
+
+  // =============================================================================
+  // CAMERA DEBUG VISUALISERING
+  // =============================================================================
+
+  // 1) CameraHelper (rödaktig wireframe från Three)
+  const cameraHelper = new THREE.CameraHelper(camera);
+  cameraHelper.renderOrder = 10000;
+  scene.add(cameraHelper);
+
+  // 2) Egen halvtransparent grön frustum-box (solid volym)
+  let frustumBoxMesh = null;
+
+  function buildOrUpdateFrustumBox() {
+    // Beräkna frustum-hörn i kamerakoordinater
+    const left   = camera.left / camera.zoom;
+    const right  = camera.right / camera.zoom;
+    const top    = camera.top / camera.zoom;
+    const bottom = camera.bottom / camera.zoom;
+    const nearZ  = -camera.near; // i kamera-lokalt (kamera tittar -Z)
+    const farZ   = -camera.far;
+
+    // Hörn i kamera-lokala koordinater (near: 0..3, far: 4..7)
+    const cornersCam = [
+      new THREE.Vector3(left,  top,    nearZ),  // 0
+      new THREE.Vector3(right, top,    nearZ),  // 1
+      new THREE.Vector3(right, bottom, nearZ),  // 2
+      new THREE.Vector3(left,  bottom, nearZ),  // 3
+      new THREE.Vector3(left,  top,    farZ),   // 4
+      new THREE.Vector3(right, top,    farZ),   // 5
+      new THREE.Vector3(right, bottom, farZ),   // 6
+      new THREE.Vector3(left,  bottom, farZ),   // 7
+    ];
+
+    // Transformera till världsrummet
+    const cornersWorld = cornersCam.map(v => v.clone().applyMatrix4(camera.matrixWorld));
+
+    // Skapa/uppdatera ett Mesh med trianglar (12 trianglar = 36 index)
+    const positions = new Float32Array(8 * 3);
+    for (let i = 0; i < 8; i++) {
+      positions[i*3 + 0] = cornersWorld[i].x;
+      positions[i*3 + 1] = cornersWorld[i].y;
+      positions[i*3 + 2] = cornersWorld[i].z;
+    }
+
+    // Index för box (två tri per sida)
+    const indices = new Uint16Array([
+      // near
+      0,1,2,   2,3,0,
+      // far
+      4,5,6,   6,7,4,
+      // sides
+      0,4,5,   5,1,0,
+      1,5,6,   6,2,1,
+      2,6,7,   7,3,2,
+      3,7,4,   4,0,3
+    ]);
+
+    if (!frustumBoxMesh) {
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geom.setIndex(new THREE.BufferAttribute(indices, 1));
+      geom.computeVertexNormals();
+
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x00ff00,
+        transparent: true,
+        opacity: 0.10,
+        depthTest: false,   // ritas ovanpå annat
+        depthWrite: false,  // skriver inte till depth-buffer (så täcker inte)
+        side: THREE.DoubleSide
+      });
+
+      frustumBoxMesh = new THREE.Mesh(geom, mat);
+      frustumBoxMesh.renderOrder = 9999; // rita sent
+      scene.add(frustumBoxMesh);
+    } else {
+      const geom = frustumBoxMesh.geometry;
+      geom.attributes.position.array.set(positions);
+      geom.attributes.position.needsUpdate = true;
+      geom.computeVertexNormals();
+      geom.computeBoundingSphere();
+      geom.computeBoundingBox();
+    }
+  }
+
+  // =============================================================================
+  // EVENTS
+  // =============================================================================
+  function onMouseMove(e) {
+    if (document.pointerLockElement === renderer3D.domElement) {
+      if (isPanning) {
+        // Pan i pointerlock
+        const panSpeed = (camera.right - camera.left) / camera.zoom / renderer3D.domElement.clientWidth;
+        const deltaX = -e.movementX * panSpeed;
+        const deltaY =  e.movementY * panSpeed;
+        const panOffset = new THREE.Vector3(deltaX, deltaY, 0).applyQuaternion(camera.quaternion);
+        camera.position.add(panOffset);
+        controls.target.add(panOffset);
+        camera.updateProjectionMatrix();
+        if (hasStart) recalibrateVirtualCursorToStart();
+        return;
+      }
+      if (isOrbiting) {
+        // (valfritt) orbit om du vill — men du har valt disableRotate, så vi nollställer direkt
+        return;
+      }
+      // Rita: uppdatera endast vår fria 2D-kurspunkts position (pixlar)
+      setVirtualCursorTo2D({
+        x: virtualCursorPix.x + e.movementX,
+        y: virtualCursorPix.y + e.movementY
+      });
+    } else {
+      // När vi INTE ritar: visa idleMarker på XZ-planet under musen
+      const ndc = new THREE.Vector2(
+        (e.clientX / window.innerWidth) * 2 - 1,
+        -(e.clientY / window.innerHeight) * 2 + 1
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hit = raycaster.intersectObject(pickPlaneMesh);
+      if (hit.length) idleMarker.position.copy(hit[0].point);
+    }
+  }
+
+  function onPointerDown(e) {
+    // vänsterklick = starta eller commit:a segment
+    if (e.button === 0) {
+      if (document.pointerLockElement !== renderer3D.domElement) {
+        // Sätt första startpunkten via XZ-pick
+        const ndc = new THREE.Vector2(
+          (e.clientX / window.innerWidth) * 2 - 1,
+          -(e.clientY / window.innerHeight) * 2 + 1
+        );
+        raycaster.setFromCamera(ndc, camera);
+        const hit = raycaster.intersectObject(pickPlaneMesh);
+        if (hit.length) {
+          lineStartPoint.copy(hit[0].point);
+          addVertexSphere(lineStartPoint, 0xff0000); // röd startprick
+          hasStart = true;
+          isDrawing = true;
+
+          // initiera glasskivan på projektionspunkten
+          recalibrateVirtualCursorToStart();
+
+          // gå in i pointer lock så du kan rita "oändligt"
+          renderer3D.domElement.requestPointerLock();
+          virtualCursorEl.style.display = 'block';
+        }
+      } else {
+        // Commit av aktuellt segment (snap vinkel + 2D→3D)
+        if (hasStart && isDrawing) {
+          const dx = virtualCursorPix.x - start2D.x;
+          const dy = start2D.y - virtualCursorPix.y; // invertera Y
+          const rawAngle = Math.atan2(dy, dx) * 180 / Math.PI;
+          const snapped = snapAngleDeg(rawAngle);
+          const dir3D = angleToIsoDir3D(snapped); // exakt din mapping
+
+          // Bestäm längd i 3D från 2D-längden, baserat på aktuell projektion
+          const pixelsPerUnit = pixelsPerWorldUnit(dir3D, lineStartPoint);
+          const pixelsLen = Math.hypot(dx, dy);
+          const worldLen = pixelsLen / pixelsPerUnit;
+
+          if (worldLen > 1e-6) {
+            const end3D = lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
+            // lägg ut 3D-linjen
+            const geom = new THREE.BufferGeometry().setFromPoints([lineStartPoint, end3D]);
+            const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xffffff }));
+            scene.add(line);
+            permanentLines.push(line);
+
+            // röd slutprick
+            addVertexSphere(end3D, 0xff0000);
+
+            // fortsätt rita från slutpunkten
+            lineStartPoint.copy(end3D);
+            recalibrateVirtualCursorToStart();
+          }
+        }
+      }
+    }
+
+    // MMB start pan under pointerlock
+    if (document.pointerLockElement === renderer3D.domElement && e.button === 1) {
+      isPanning = true;
+    }
+  }
+
+  function onPointerUp(e) {
+    if (e.button === 1) isPanning = false;
+  }
+
+  function onClick(e) {
+    // vi använder pointerdown för commit/start, här behövs inget
+  }
+
+  function onWheel(e) {
+    // stöd zoom under pointerlock också
+    if (document.pointerLockElement === renderer3D.domElement) {
+      e.preventDefault();
+      const zoomSpeed = 0.1;
+      const zoomFactor = e.deltaY > 0 ? (1 - zoomSpeed) : (1 + zoomSpeed);
+      camera.zoom *= zoomFactor;
+      camera.zoom = Math.max(0.1, Math.min(camera.zoom, 10));
+      camera.updateProjectionMatrix();
+      if (hasStart) recalibrateVirtualCursorToStart();
+    }
+  }
+
+  function onKeyDown(e) {
+    if (e.key === 'Control' && document.pointerLockElement === renderer3D.domElement) {
+      isOrbiting = true;
+    }
+  }
+
+  function onKeyUp(e) {
+    if (e.code === 'Escape') {
+      // Avsluta rit-sekvens och lämna pointer lock
+      if (document.pointerLockElement) document.exitPointerLock();
+      isDrawing = false;
+      hasStart = false;
+      virtualCursorEl.style.display = 'none';
+    }
+    if (e.key === 'Control') {
+      if (isOrbiting) {
+        isOrbiting = false;
+        // behåll kameran; kalibrera mus om vi ritar
+        if (hasStart) recalibrateVirtualCursorToStart();
+      }
+    }
+  }
+
+  function onPointerLockChange() {
+    if (document.pointerLockElement === renderer3D.domElement) {
+      controls.enabled = false;
+      virtualCursorEl.style.display = 'block';
+      if (hasStart) recalibrateVirtualCursorToStart();
+    } else {
+      controls.enabled = true;
+      virtualCursorEl.style.display = 'none';
+      isPanning = false;
+      isOrbiting = false;
+    }
+  }
+
+  function onResize() {
+    const aspect = window.innerWidth / window.innerHeight;
+    camera.left   = -frustumSize * aspect / 2;
+    camera.right  =  frustumSize * aspect / 2;
+    camera.top    =  frustumSize / 2;
+    camera.bottom = -frustumSize / 2;
+    camera.updateProjectionMatrix();
+    renderer3D.setSize(window.innerWidth, window.innerHeight);
+    overlay.width  = window.innerWidth;
+    overlay.height = window.innerHeight;
+    if (hasStart) recalibrateVirtualCursorToStart();
+  }
+
+  // =============================================================================
+  // ANIMATE
+  // =============================================================================
+  function render3D() {
+    renderer3D.render(scene, camera);
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    // uppdatera frustum-visualisering
+    cameraHelper.update();
+    buildOrUpdateFrustumBox();
+
+    controls.update();
+    render3D();
+    drawOverlay();
+  }
+
+  // =============================================================================
+  // WIRE UP
+  // =============================================================================
+  renderer3D.domElement.addEventListener('mousemove', onMouseMove, false);
+  renderer3D.domElement.addEventListener('pointerdown', onPointerDown, true);
+  renderer3D.domElement.addEventListener('pointerup', onPointerUp, false);
+  renderer3D.domElement.addEventListener('click', onClick, false);
+  renderer3D.domElement.addEventListener('wheel', onWheel, { passive: false });
+
+  window.addEventListener('keydown', onKeyDown, false);
+  window.addEventListener('keyup', onKeyUp, false);
+  window.addEventListener('resize', onResize, false);
+  document.addEventListener('pointerlockchange', onPointerLockChange, false);
+
+  animate();
+  </script>
+</body>
+</html>

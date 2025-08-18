@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Threesometric – Glasskiva + CameraControls</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; overflow: hidden; background-color: #22223b; cursor: crosshair; }
+    canvas { display: block; position: absolute; top: 0; left: 0; }
+    #virtual-cursor {
+      position: fixed;
+      width: 12px;
+      height: 12px;
+      border: 2px solid white;
+      border-radius: 50%;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      display: none;
+      z-index: 9999;
+      box-sizing: border-box;
+    }
+    #hud {
+      position: fixed; left: 8px; bottom: 8px; z-index: 10000;
+      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color:#ddd; opacity:.85; background: rgba(0,0,0,.25); padding:8px 10px; border-radius:8px;
+      backdrop-filter: blur(6px);
+    }
+    #hud kbd { background:#111; padding:1px 4px; border-radius:4px; border:1px solid #333; }
+  </style>
+</head>
+<body>
+  <div id="virtual-cursor"></div>
+  <div id="hud">
+    <div><strong>Ritläge:</strong> vänsterklick = start/commit, <kbd>Esc</kbd> = avsluta sekvens</div>
+    <div><strong>Pan:</strong> mellanknapp • <strong>Zoom:</strong> rullhjul • <strong>Dolly (höger-drag):</strong> på</div>
+    <div>Vinkel snäpps först vid commit (30°, 90°, 150°, 210°, 270°, 330°)</div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/OrbitControls.js",
+      "three/examples/jsm/controls/CameraControls.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/CameraControls.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
+  import CameraControls from 'camera-controls';
+
+  CameraControls.install( { THREE: THREE } );
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x22223b);
+
+  const frustumSize = 20;
+  const aspect = window.innerWidth / window.innerHeight;
+  const camera = new THREE.OrthographicCamera(
+    -frustumSize * aspect / 2,
+     frustumSize * aspect / 2,
+     frustumSize / 2,
+    -frustumSize / 2,
+    1,
+    4000
+  );
+  camera.position.set(50, 50, 50);
+  camera.lookAt(0,0,0);
+
+  // Valfritt: Oblique projection för bättre hantering av isometriska vyer
+  // const alpha = 0.5; // Shear X
+  // const beta = 0.5;  // Shear Y
+  // camera.projectionMatrix.elements[8] = alpha;
+  // camera.projectionMatrix.elements[9] = beta;
+  // camera.updateProjectionMatrix();
+
+  const renderer3D = new THREE.WebGLRenderer({ 
+    antialias: true,
+    logarithmicDepthBuffer: true  // Aktiverad för bättre djupprecision och mindre z-fighting
+  });
+  renderer3D.setSize(window.innerWidth, window.innerHeight);
+  document.body.appendChild(renderer3D.domElement);
+
+  const clock = new THREE.Clock();
+  const controls = new CameraControls(camera, renderer3D.domElement);
+  controls.mouseButtons.left = CameraControls.ACTION.NONE;
+  controls.mouseButtons.middle = CameraControls.ACTION.TRUCK;
+  controls.mouseButtons.right = CameraControls.ACTION.ROTATE;
+  controls.minZoom = 0.1;
+  controls.maxZoom = 10;
+  controls.smoothTime = 0.05;         // Lägre för snabbare övergångar
+  controls.draggingSmoothTime = 0.01; // Minimal lag vid drag
+  controls.truckSpeed = 4.0;          // Snabbare panning
+
+  const gridHelper = new THREE.GridHelper(100, 100, 0x444444, 0x888888);
+  scene.add(gridHelper);
+
+  const idleMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.2, 16, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  scene.add(idleMarker);
+
+  const pickPlaneMesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(100, 100),
+    new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide })
+  );
+  pickPlaneMesh.rotation.x = -Math.PI / 2;
+  scene.add(pickPlaneMesh);
+
+  const raycaster = new THREE.Raycaster();
+
+  const overlay = document.createElement('canvas');
+  overlay.width = window.innerWidth;
+  overlay.height = window.innerHeight;
+  overlay.style.pointerEvents = 'none';
+  document.body.appendChild(overlay);
+  const ctx = overlay.getContext('2d');
+
+  let isDrawing = false;
+  let hasStart = false;
+  let lineStartPoint = new THREE.Vector3();
+  let start2D = { x: 0, y: 0 };
+  const virtualCursorEl = document.getElementById('virtual-cursor');
+  let virtualCursorPix = { x: 0, y: 0 };
+  let isPanning = false;
+
+  const modelGroup = new THREE.Group();
+  scene.add(modelGroup);
+
+  const permanentLines = [];
+  const permanentVertices = new THREE.Group();
+  modelGroup.add(permanentVertices);
+
+  function addVertexSphere(pos, color=0xff0000) {
+    const s = new THREE.Mesh(
+      new THREE.SphereGeometry(0.1, 16, 8),
+      new THREE.MeshBasicMaterial({ color })
+    );
+    s.position.copy(pos);
+    permanentVertices.add(s);
+  }
+
+  function projectTo2D(v3) {
+    const v = v3.clone().project(camera);
+    return {
+      x: (v.x + 1) * 0.5 * overlay.width,
+      y: (-v.y + 1) * 0.5 * overlay.height
+    };
+  }
+
+  function pixelsPerWorldUnit(dir3D, origin3D) {
+    const step = 1;
+    const p0 = projectTo2D(origin3D);
+    const p1 = projectTo2D(origin3D.clone().add(dir3D.clone().normalize().multiplyScalar(step)));
+    const dx = p1.x - p0.x;
+    const dy = p1.y - p0.y;
+    const d = Math.hypot(dx, dy);
+    return d < 1e-6 ? 1e-6 : d;
+  }
+
+  const ISO_ANGLES = [30, 90, 150, 210, 270, 330];
+  function angleToIsoDir3D(angleDeg) {
+    const dirs = {
+      330: new THREE.Vector3( 1,  0,  0),
+       30: new THREE.Vector3( 0,  0, -1),
+       90: new THREE.Vector3( 0,  1,  0),
+      150: new THREE.Vector3(-1,  0,  0),
+      210: new THREE.Vector3( 0,  0,  1),
+      270: new THREE.Vector3( 0, -1,  0),
+    };
+    return dirs[angleDeg].clone();
+  }
+
+  function snapAngleDeg(rawAngle) {
+    const norm = ((rawAngle % 360) + 360) % 360;
+    let best = ISO_ANGLES[0];
+    let bestDiff = 1e9;
+    for (const a of ISO_ANGLES) {
+      const d = Math.min(Math.abs(norm - a), 360 - Math.abs(norm - a));
+      if (d < bestDiff) { bestDiff = d; best = a; }
+    }
+    return best;
+  }
+
+  function drawOverlay() {
+    ctx.clearRect(0,0,overlay.width, overlay.height);
+    if (hasStart) {
+      ctx.fillStyle = 'rgba(255,0,0,.9)';
+      ctx.beginPath();
+      ctx.arc(start2D.x, start2D.y, 3, 0, Math.PI*2);
+      ctx.fill();
+    }
+    if (hasStart && isDrawing) {
+      ctx.strokeStyle = 'white';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(start2D.x, start2D.y);
+      ctx.lineTo(virtualCursorPix.x, virtualCursorPix.y);
+      ctx.stroke();
+    }
+  }
+
+  function setVirtualCursorTo2D(pix) {
+    virtualCursorPix.x = pix.x;
+    virtualCursorPix.y = pix.y;
+    const clampedX = Math.max(-9999, Math.min(window.innerWidth + 9999, pix.x));
+    const clampedY = Math.max(-9999, Math.min(window.innerHeight + 9999, pix.y));
+    virtualCursorEl.style.left = clampedX + 'px';
+    virtualCursorEl.style.top  = clampedY + 'px';
+  }
+
+  function recalibrateVirtualCursorToStart() {
+    start2D = projectTo2D(lineStartPoint);
+    setVirtualCursorTo2D({ x: start2D.x, y: start2D.y });
+  }
+
+  const cameraHelper = new THREE.CameraHelper(camera);
+  scene.add(cameraHelper);
+
+  function buildOrUpdateFrustumBox() {
+    const left   = camera.left / camera.zoom;
+    const right  = camera.right / camera.zoom;
+    const top    = camera.top / camera.zoom;
+    const bottom = camera.bottom / camera.zoom;
+    const nearZ  = -camera.near;
+    const farZ   = -camera.far;
+    const cornersCam = [
+      new THREE.Vector3(left,  top,    nearZ),
+      new THREE.Vector3(right, top,    nearZ),
+      new THREE.Vector3(right, bottom, nearZ),
+      new THREE.Vector3(left,  bottom, nearZ),
+      new THREE.Vector3(left,  top,    farZ),
+      new THREE.Vector3(right, top,    farZ),
+      new THREE.Vector3(right, bottom, farZ),
+      new THREE.Vector3(left,  bottom, farZ),
+    ];
+    const cornersWorld = cornersCam.map(v => v.clone().applyMatrix4(camera.matrixWorld));
+    const positions = new Float32Array(8 * 3);
+    for (let i = 0; i < 8; i++) {
+      positions[i*3 + 0] = cornersWorld[i].x;
+      positions[i*3 + 1] = cornersWorld[i].y;
+      positions[i*3 + 2] = cornersWorld[i].z;
+    }
+    const indices = new Uint16Array([
+      0,1,2,   2,3,0,
+      4,5,6,   6,7,4,
+      0,4,5,   5,1,0,
+      1,5,6,   6,2,1,
+      2,6,7,   7,3,2,
+      3,7,4,   4,0,3
+    ]);
+    if (!window.frustumBoxMesh) {
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geom.setIndex(new THREE.BufferAttribute(indices, 1));
+      geom.computeVertexNormals();
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0x00ff00,
+        transparent: true,
+        opacity: 0.10,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide
+      });
+      window.frustumBoxMesh = new THREE.Mesh(geom, mat);
+      scene.add(window.frustumBoxMesh);
+    } else {
+      const geom = window.frustumBoxMesh.geometry;
+      geom.attributes.position.array.set(positions);
+      geom.attributes.position.needsUpdate = true;
+      geom.computeVertexNormals();
+    }
+  }
+
+  function isPointInFrustum(point3D) {
+    const vector = point3D.clone().project(camera);
+    return vector.x >= -1 && vector.x <= 1 && vector.y >= -1 && vector.y <= 1 && vector.z < 1;
+  }
+
+  function animateCameraToPoint(targetPoint, duration = 500) {
+    const startPos = camera.position.clone();
+    const startTarget = new THREE.Vector3();
+    controls.getTarget(startTarget);
+    const offset = targetPoint.clone().sub(startTarget);
+    const targetPos = startPos.clone().add(offset);
+    const targetTarget = targetPoint.clone();
+
+    let startTime = Date.now();
+    function animatePan() {
+      const elapsed = Date.now() - startTime;
+      const progress = Math.min(elapsed / duration, 1);
+      const eased = progress * progress * (3 - 2 * progress); // Quadratic easing
+
+      const currentPos = new THREE.Vector3().lerpVectors(startPos, targetPos, eased);
+      camera.position.copy(currentPos);
+
+      const currentTarget = new THREE.Vector3().lerpVectors(startTarget, targetTarget, eased);
+      controls.setTarget(currentTarget.x, currentTarget.y, currentTarget.z, false); // false för ingen transition
+
+      camera.updateProjectionMatrix();
+
+      if (progress < 1) requestAnimationFrame(animatePan);
+      else if (hasStart) recalibrateVirtualCursorToStart();
+    }
+    animatePan();
+  }
+
+  function updateNearFar() {
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    if (!box.isEmpty()) {
+      const depth = box.max.z - box.min.z;
+      camera.near = Math.max(0.1, box.min.z - depth * 0.1);
+      camera.far = box.max.z + depth * 0.1;
+      camera.updateProjectionMatrix();
+    }
+  }
+
+  function onMouseMove(e) {
+    if (document.pointerLockElement === renderer3D.domElement) {
+      if (isPanning) {
+        const panSpeed = (camera.right - camera.left) / camera.zoom / renderer3D.domElement.clientWidth;
+        const deltaX = -e.movementX * panSpeed;
+        const deltaY =  e.movementY * panSpeed;
+        const panOffset = new THREE.Vector3(deltaX, deltaY, 0).applyQuaternion(camera.quaternion);
+        camera.position.add(panOffset);
+        const currentTarget = new THREE.Vector3();
+        controls.getTarget(currentTarget);
+        currentTarget.add(panOffset);
+        controls.setTarget(currentTarget.x, currentTarget.y, currentTarget.z);
+        camera.updateProjectionMatrix();
+        if (hasStart) recalibrateVirtualCursorToStart();
+        return;
+      }
+      setVirtualCursorTo2D({
+        x: virtualCursorPix.x + e.movementX,
+        y: virtualCursorPix.y + e.movementY
+      });
+    } else {
+      const ndc = new THREE.Vector2(
+        (e.clientX / window.innerWidth) * 2 - 1,
+        -(e.clientY / window.innerHeight) * 2 + 1
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hit = raycaster.intersectObject(pickPlaneMesh);
+      if (hit.length) idleMarker.position.copy(hit[0].point);
+    }
+  }
+
+  function onPointerDown(e) {
+    if (e.button === 0) {
+      if (document.pointerLockElement !== renderer3D.domElement) {
+        const ndc = new THREE.Vector2(
+          (e.clientX / window.innerWidth) * 2 - 1,
+          -(e.clientY / window.innerHeight) * 2 + 1
+        );
+        raycaster.setFromCamera(ndc, camera);
+        const hit = raycaster.intersectObject(pickPlaneMesh);
+        if (hit.length) {
+          lineStartPoint.copy(hit[0].point);
+          addVertexSphere(lineStartPoint, 0xff0000);
+          hasStart = true;
+          isDrawing = true;
+          recalibrateVirtualCursorToStart();
+          renderer3D.domElement.requestPointerLock();
+          virtualCursorEl.style.display = 'block';
+        }
+      } else {
+        if (hasStart && isDrawing) {
+          const dx = virtualCursorPix.x - start2D.x;
+          const dy = start2D.y - virtualCursorPix.y;
+          const rawAngle = Math.atan2(dy, dx) * 180 / Math.PI;
+          const snapped = snapAngleDeg(rawAngle);
+          const dir3D = angleToIsoDir3D(snapped);
+          const pixelsPerUnit = pixelsPerWorldUnit(dir3D, lineStartPoint);
+          const pixelsLen = Math.hypot(dx, dy);
+          const worldLen = pixelsLen / pixelsPerUnit;
+          if (worldLen > 1e-6) {
+            const end3D = lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
+            const geom = new THREE.BufferGeometry().setFromPoints([lineStartPoint, end3D]);
+            const line = new THREE.Line(geom, new THREE.LineBasicMaterial({ color: 0xffffff }));
+            modelGroup.add(line); // Lägg till i modelGroup istället för scene
+            permanentLines.push(line);
+            addVertexSphere(end3D, 0xff0000);
+            lineStartPoint.copy(end3D);
+            recalibrateVirtualCursorToStart();
+
+            // Auto-pan om endpoint utanför frustum
+            if (!isPointInFrustum(end3D)) {
+              animateCameraToPoint(end3D);
+            }
+
+            // Uppdatera near/far efter ny linje
+            updateNearFar();
+          }
+        }
+      }
+    }
+    if (document.pointerLockElement === renderer3D.domElement && e.button === 1) {
+      isPanning = true;
+    }
+  }
+
+  function onPointerUp(e) {
+    if (e.button === 1) isPanning = false;
+  }
+
+  function onWheel(e) {
+    if (document.pointerLockElement === renderer3D.domElement) {
+      e.preventDefault();
+      const zoomSpeed = 0.1;
+      const zoomFactor = e.deltaY > 0 ? (1 - zoomSpeed) : (1 + zoomSpeed);
+      camera.zoom *= zoomFactor;
+      camera.zoom = Math.max(0.1, Math.min(camera.zoom, 10));
+      camera.updateProjectionMatrix();
+      if (hasStart) recalibrateVirtualCursorToStart();
+    }
+  }
+
+  function onKeyUp(e) {
+    if (e.code === 'Escape') {
+      if (document.pointerLockElement) document.exitPointerLock();
+      isDrawing = false;
+      hasStart = false;
+      virtualCursorEl.style.display = 'none';
+
+      // Shrink to fit vid inspektionsläge
+      const box = new THREE.Box3().setFromObject(modelGroup);
+      if (!box.isEmpty()) {
+        controls.fitToBox(box, true, { // true för smidig animation
+          cover: false,
+          paddingTop: 2,    // Marginaler för utstickande hörn
+          paddingRight: 2,
+          paddingBottom: 2,
+          paddingLeft: 2
+        });
+        updateNearFar(); // Uppdatera near/far efter fit
+      }
+    }
+  }
+
+  function onPointerLockChange() {
+    controls.enabled = !document.pointerLockElement;
+    if (document.pointerLockElement) {
+      virtualCursorEl.style.display = 'block';
+      if (hasStart) recalibrateVirtualCursorToStart();
+    } else {
+      virtualCursorEl.style.display = 'none';
+      isPanning = false;
+    }
+  }
+
+  function onResize() {
+    const aspect = window.innerWidth / window.innerHeight;
+    camera.left   = -frustumSize * aspect / 2;
+    camera.right  =  frustumSize * aspect / 2;
+    camera.top    =  frustumSize / 2;
+    camera.bottom = -frustumSize / 2;
+    camera.updateProjectionMatrix();
+    renderer3D.setSize(window.innerWidth, window.innerHeight);
+    overlay.width  = window.innerWidth;
+    overlay.height = window.innerHeight;
+    if (hasStart) recalibrateVirtualCursorToStart();
+  }
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const delta = clock.getDelta();
+    controls.update(delta);
+    cameraHelper.update();
+    buildOrUpdateFrustumBox();
+    renderer3D.render(scene, camera);
+    drawOverlay();
+  }
+
+  renderer3D.domElement.addEventListener('mousemove', onMouseMove, false);
+  renderer3D.domElement.addEventListener('pointerdown', onPointerDown, true);
+  renderer3D.domElement.addEventListener('pointerup', onPointerUp, false);
+  renderer3D.domElement.addEventListener('wheel', onWheel, { passive: false });
+  window.addEventListener('keyup', onKeyUp, false);
+  window.addEventListener('resize', onResize, false);
+  document.addEventListener('pointerlockchange', onPointerLockChange, false);
+
+  animate();
+  </script>
+</body>
+</html>

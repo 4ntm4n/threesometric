@@ -20,6 +20,7 @@
   },
   "homepage": "https://github.com/4ntm4n/threesometric#readme",
   "dependencies": {
+    "camera-controls": "^3.1.0",
     "three": "^0.179.1"
   },
   "devDependencies": {
