@@ -1,4 +1,53 @@
-import * as THREE from 'three';
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Threesometric – Glasskiva + CameraControls</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; overflow: hidden; background-color: #0f3a2d; cursor: crosshair; }
+    canvas { display: block; position: absolute; top: 0; left: 0; }
+    #virtual-cursor {
+      position: fixed;
+      width: 12px;
+      height: 12px;
+      border: 2px solid white;
+      border-radius: 50%;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      display: none;
+      z-index: 9999;
+      box-sizing: border-box;
+    }
+    #hud {
+      position: fixed; left: 8px; bottom: 8px; z-index: 10000;
+      font: 12px/1.35 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      color:#ddd; opacity:.85; background: rgba(0,0,0,.25); padding:8px 10px; border-radius:8px;
+      backdrop-filter: blur(6px);
+    }
+    #hud kbd { background:#111; padding:1px 4px; border-radius:4px; border:1px solid #333; }
+  </style>
+</head>
+<body>
+  <div id="virtual-cursor"></div>
+  <div id="hud">
+    <div><strong>Inspektion:</strong> rotera/pan/zoom • <strong>Klick:</strong> välj startpunkt → Ritläge</div>
+    <div><strong>Ritläge:</strong> pan/zoom tillåtet (rotation av). Vänsterklick = commit, <kbd>Esc</kbd> = avbryt → Inspektion</div>
+    <div>Vinkel snäpps vid commit (30°, 90°, 150°, 210°, 270°, 330°)</div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/examples/jsm/controls/CameraControls.js": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/controls/CameraControls.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
   import CameraControls from 'camera-controls';
   CameraControls.install({ THREE });
 
@@ -534,3 +583,6 @@ import * as THREE from 'three';
   document.addEventListener('pointerlockchange', onPointerLockChange, false);
 
   animate();
+  </script>
+</body>
+</html>
