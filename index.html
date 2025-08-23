@@ -126,6 +126,32 @@
   const permanentVertices = new THREE.Group();
   modelGroup.add(permanentVertices);
 
+  // NEW: grupp för pickables (osynliga mesh runt linjer)
+  const pickables = new THREE.Group();
+  scene.add(pickables);
+
+  // --- helper: skapa osynlig cylinder runt linje ---
+  function makePickCylinder(start, end, radius = 0.2) {
+    const dir = new THREE.Vector3().subVectors(end, start);
+    const len = dir.length();
+    const geom = new THREE.CylinderGeometry(radius, radius, len, 6, 1, true);
+    const mat = new THREE.MeshBasicMaterial({ visible: false });
+    const mesh = new THREE.Mesh(geom, mat);
+
+    // orientera cylindern längs linjen
+    mesh.position.copy(start).add(end).multiplyScalar(0.5);
+    mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+    mesh.userData = { start: start.clone(), end: end.clone() }; // spara segmentet
+    return mesh;
+  }
+
+  // --- helper: närmaste punkt på linjesegment ---
+  function closestPointOnSegment(p, a, b) {
+    const ab = new THREE.Vector3().subVectors(b, a);
+    const t = Math.max(0, Math.min(1, new THREE.Vector3().subVectors(p, a).dot(ab) / ab.lengthSq()));
+    return a.clone().add(ab.multiplyScalar(t));
+  }
+
   // --- BASELINE för fit ---
   const BASELINE_BOUNDS = new THREE.Box3(
     new THREE.Vector3(-60,-5,-60),
@@ -142,7 +168,33 @@
   let isDrawing = false;
   let hasStart = false;
   let isInteracting = false; // TRUE mellan controlstart/controlend
-  let pendingDraw = false;   // 👈 vänta tills pointer lock innan gummisnodden startar
+  let pendingDraw = false;   // vänta tills pointer lock innan gummisnodden startar
+
+  // --- NODE-SNAP ---
+  const SNAP_RADIUS_PX = 12; // justera vid behov; kan göras inställningsbar
+
+  function projectTo2D(v3) {
+    const v = v3.clone().project(camera);
+    return { x: (v.x + 1) * 0.5 * overlay.width, y: (-v.y + 1) * 0.5 * overlay.height };
+  }
+
+  function findNearestNode2D(screenX, screenY) {
+    // projectTo2D ger coords i window-pixlar; jämför mot event.clientX/Y
+    let nearest = null;
+    let bestDist = SNAP_RADIUS_PX;
+    permanentVertices.children.forEach(node => {
+      const pix = projectTo2D(node.position);
+      const dx = pix.x - screenX;
+      const dy = pix.y - screenY;
+      const d = Math.hypot(dx, dy);
+      if (d < bestDist) { bestDist = d; nearest = node; }
+    });
+    return nearest ? nearest.position.clone() : null;
+  }
+
+  function setIdleMarkerColor(hex) {
+    idleMarker.material.color.setHex(hex);
+  }
 
   // --- utilities ---
   function addVertexSphere(pos, color=0xffdede) {
@@ -171,25 +223,19 @@
     return new THREE.Vector2(x, y);
   }
 
-  function projectTo2D(v3) {
-    const v = v3.clone().project(camera);
-    return { x: (v.x + 1) * 0.5 * overlay.width, y: (-v.y + 1) * 0.5 * overlay.height };
-  }
-
   // --- dela kalibreringen ---
   function recomputeStart2D() {
     start2D = projectTo2D(lineStartPoint); // uppdatera endast projektionen
   }
-  function recenterCursorToStart() {
-    recomputeStart2D();
-    setVirtualCursorTo2D({ x: start2D.x, y: start2D.y }); // flytta pekaren
-  }
-
   function setVirtualCursorTo2D(pix) {
     virtualCursorPix.x = pix.x; virtualCursorPix.y = pix.y;
     const clampedX = Math.max(-9999, Math.min(window.innerWidth + 9999, pix.x));
     const clampedY = Math.max(-9999, Math.min(window.innerHeight + 9999, pix.y));
     virtualCursorEl.style.left = clampedX + 'px'; virtualCursorEl.style.top = clampedY + 'px';
+  }
+  function recenterCursorToStart() {
+    recomputeStart2D();
+    setVirtualCursorTo2D({ x: start2D.x, y: start2D.y }); // flytta pekaren
   }
 
   function pixelsPerWorldUnit(dir3D, origin3D) {
@@ -306,7 +352,7 @@
   // --- Läge: Rit ---
   function enterDrawMode(startPoint) {
     // Aktivera inte ritningen ännu → vänta tills pointer lock är klart
-    pendingDraw = true;   // 👈
+    pendingDraw = true;
     hasStart = true;
 
     // Lås ISO + stäng av rotation; dollyToCursor AV i ritläge
@@ -364,8 +410,30 @@
         setVirtualCursorTo2D({ x: virtualCursorPix.x + e.movementX, y: virtualCursorPix.y + e.movementY });
       }
     } else {
+      // INSPEKTION: prio = Nod-snap → Linje → Plan
+      const nodeSnapPos = findNearestNode2D(e.clientX, e.clientY);
+      if (nodeSnapPos) {
+        idleMarker.position.copy(nodeSnapPos);
+        setIdleMarkerColor(0x80ff80);
+        return;
+      } else {
+        setIdleMarkerColor(0xffffff);
+      }
+
       const ndc = getNDCFromEvent(e);
       raycaster.setFromCamera(ndc, camera);
+
+      // Linje (pickables)
+      const hits = raycaster.intersectObjects(pickables.children, false);
+      if (hits.length > 0) {
+        const hit = hits[0];
+        const seg = hit.object.userData;
+        const nearest = closestPointOnSegment(hit.point, seg.start, seg.end);
+        idleMarker.position.copy(nearest);
+        return;
+      }
+
+      // Plan
       const hit = raycaster.intersectObject(pickPlaneMesh);
       if (hit.length) idleMarker.position.copy(hit[0].point);
     }
@@ -379,17 +447,40 @@
   function onPointerDown(e) {
     if (e.button === 0) {
       if (!document.pointerLockElement) {
-        // INSPEKTION: klick = välj startpunkt + in i ritläge
+        // INSPEKTION: klick = välj startpunkt (nod → linje → plan)
+        const nodeSnapPos = findNearestNode2D(e.clientX, e.clientY);
+        if (nodeSnapPos) {
+          lineStartPoint.copy(nodeSnapPos);
+          addVertexSphere(lineStartPoint, 0xffdede);
+          enterDrawMode(lineStartPoint);
+          return;
+        }
+
         const ndc = getNDCFromEvent(e);
         raycaster.setFromCamera(ndc, camera);
+
+        // Linje-träff
+        const hits = raycaster.intersectObjects(pickables.children, false);
+        if (hits.length > 0) {
+          const hit = hits[0];
+          const seg = hit.object.userData;
+          const nearest = closestPointOnSegment(hit.point, seg.start, seg.end);
+          lineStartPoint.copy(nearest);
+          addVertexSphere(lineStartPoint, 0xffdede);
+          enterDrawMode(lineStartPoint);
+          return;
+        }
+
+        // Fallback: markplanet
         const hit = raycaster.intersectObject(pickPlaneMesh);
         if (hit.length) {
           lineStartPoint.copy(hit[0].point);
           addVertexSphere(lineStartPoint, 0xffdede);
           enterDrawMode(lineStartPoint);
         }
+
       } else {
-        // RITLÄGE: commit – men bara om vi INTE pan/zoomar just nu
+        // RITLÄGE: commit
         if (isDrawing && hasStart && !isInteracting) {
           const dx = virtualCursorPix.x - start2D.x;
           const dy = start2D.y - virtualCursorPix.y;
@@ -403,20 +494,22 @@
             const end3D = lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
             const geom = new THREE.BufferGeometry().setFromPoints([lineStartPoint, end3D]);
             const line = new THREE.Line(geom, makeLineMaterial());
-            line.renderOrder = 1; // över grid
+            line.renderOrder = 1;
             modelGroup.add(line);
             permanentLines.push(line);
             addVertexSphere(end3D, 0xffdede);
+
+            // Skapa pick-cylinder för raycast
+            const pickCyl = makePickCylinder(lineStartPoint, end3D);
+            pickables.add(pickCyl);
+
             lineStartPoint.copy(end3D);
 
-            // Auto-pan om end är utanför fönstret (ISO bevaras)
             const maybePan = (!isPointInFrustum(end3D))
               ? lookIsoAt(end3D, true).then(() => { if (isDrawing) recenterCursorToStart(); })
               : Promise.resolve();
 
-            maybePan.then(() => {
-              recenterCursorToStart();
-            });
+            maybePan.then(() => { recenterCursorToStart(); });
           }
         }
       }
@@ -439,11 +532,7 @@
       if (hasStart) {
         virtualCursorEl.style.display = 'block';
         recenterCursorToStart(); // pekaren hoppar till start först NU
-
-        if (pendingDraw) {       // 👈 aktivera ritläget efter pointer lock
-          isDrawing = true;
-          pendingDraw = false;
-        }
+        if (pendingDraw) { isDrawing = true; pendingDraw = false; }
       }
     }
   }
@@ -458,20 +547,20 @@
     renderer3D.setSize(window.innerWidth, window.innerHeight);
     overlay.width  = window.innerWidth;
     overlay.height = window.innerHeight;
-    if (isDrawing && hasStart) recomputeStart2D(); // uppdatera endast projektion
+    if (isDrawing && hasStart) recomputeStart2D();
   }
 
   // Synka gummisnodden under CameraControls-interaktioner
   controls.addEventListener('controlstart', () => { 
     isInteracting = true;  
-    if (isDrawing && hasStart) recomputeStart2D(); // inte recenter
+    if (isDrawing && hasStart) recomputeStart2D();
   });
   controls.addEventListener('control',      () => { 
-    if (isDrawing && hasStart) recomputeStart2D(); // inte recenter
+    if (isDrawing && hasStart) recomputeStart2D();
   });
   controls.addEventListener('controlend',   () => { 
     isInteracting = false; 
-    if (isDrawing && hasStart) recomputeStart2D(); // inte recenter
+    if (isDrawing && hasStart) recomputeStart2D();
   });
 
   function animate() {
