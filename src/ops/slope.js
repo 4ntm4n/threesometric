@@ -1,26 +1,59 @@
-import { state } from '../state/appState.js';
+// ──────────────────────────────────────────────────────────────────────────────
+// src/ops/slope.js
+// Slope A→B på användarens center-nät:
+//  • Path via endast center-edges (inga construction).
+//  • Endast horisontella segment får fall: y_next = y_prev - s*horiz.
+//  • Vertikaler och redan lutande segment bevarar sitt Δy (ingen extra lutning).
+// ──────────────────────────────────────────────────────────────────────────────
 
-// Hjälp: horisontell distans (i XZ)
-function horizDist(a, b) {
-  const dx = b.x - a.x, dz = b.z - a.z;
-  return Math.hypot(dx, dz);
+const EPS = 1e-6;
+
+// ——— utils: world pos / set world Y (fallbacks om graph saknar helpers)
+function getNodeWorldPos(graph, nodeId) {
+  if (typeof graph.getNodeWorldPos === 'function') return graph.getNodeWorldPos(nodeId);
+  const n = graph.nodes?.get(nodeId);
+  if (!n) return { x:0,y:0,z:0 };
+  if (n.pos) return n.pos;
+  const b = n.base || {x:0,y:0,z:0};
+  const o = n.offset || {x:0,y:0,z:0};
+  return { x:(b.x??0)+(o.x??0), y:(b.y??0)+(o.y??0), z:(b.z??0)+(o.z??0) };
+}
+function setNodeWorldY(graph, nodeId, yNew) {
+  if (typeof graph.setNodeWorldY === 'function') { graph.setNodeWorldY(nodeId, yNew); return; }
+  const n = graph.nodes?.get(nodeId); if (!n) return;
+  if (n.pos) { n.pos.y = yNew; return; }
+  if (!n.base) n.base = { x:0,y:0,z:0 };
+  if (!n.offset) n.offset = { x:0,y:0,z:0 };
+  const curY = (n.base.y ?? 0) + (n.offset.y ?? 0);
+  n.offset.y = (n.offset.y ?? 0) + (yNew - curY);
 }
 
-// En enkel Dijkstra på nodgrafen, vikt = horisontell distans, endast center-edges.
-// Returnerar en array av nodeIds i ordning A..B, eller null.
-export function pathBetween(graph, startId, goalId) {
+// ——— geometri
+function horizDistXZ(a, b) { const dx=b.x-a.x, dz=b.z-a.z; return Math.hypot(dx, dz); }
+function isAlmostZero(v)   { return Math.abs(v) < EPS; }
+
+// ——— grannar: endast center-edges (exkl. construction)
+function* neighborsCenter(graph, nodeId) {
+  const bag = graph.adj?.get(nodeId);
+  if (!bag) return;
+  for (const eid of bag) {
+    const e = graph.edges.get(eid);
+    if (!e || e.kind !== 'center') continue;
+    const otherId = (e.a === nodeId) ? e.b : e.a;
+    yield { edge: e, otherId };
+  }
+}
+
+// ——— enkel Dijkstra (alla center-edges vikt = 1)
+function pathCenterAB(graph, aId, bId) {
+  if (!graph?.nodes?.size) return null;
   const dist = new Map();
   const prev = new Map();
-  const unvisited = new Set();
-
-  for (const id of graph.nodes.keys()) {
-    dist.set(id, Infinity);
-    unvisited.add(id);
-  }
-  dist.set(startId, 0);
+  const unvisited = new Set(graph.nodes.keys());
+  for (const id of unvisited) dist.set(id, Infinity);
+  dist.set(aId, 0);
 
   while (unvisited.size) {
-    // plocka nod med minsta dist
     let u = null, best = Infinity;
     for (const id of unvisited) {
       const d = dist.get(id);
@@ -28,29 +61,24 @@ export function pathBetween(graph, startId, goalId) {
     }
     if (u == null) break;
     unvisited.delete(u);
-    if (u === goalId) break;
+    if (u === bId) break;
 
-    const uNode = graph.getNode(u);
-    for (const { edge, otherId } of graph.neighbors(u, { kind: 'center' })) {
+    for (const { otherId } of neighborsCenter(graph, u)) {
       if (!unvisited.has(otherId)) continue;
-      const vNode = graph.getNode(otherId);
-      const w = horizDist(uNode.pos, vNode.pos);
-      const alt = dist.get(u) + w;
+      const alt = dist.get(u) + 1;
       if (alt < dist.get(otherId)) {
         dist.set(otherId, alt);
         prev.set(otherId, u);
       }
     }
   }
+  if (!prev.has(bId) && aId !== bId) return null;
 
-  if (!prev.has(goalId) && startId !== goalId) return null;
-
-  // bygg väg bakifrån
-  const path = [goalId];
-  let cur = goalId;
-  while (cur !== startId) {
+  // bygg path bakifrån
+  const path = [bId];
+  for (let cur = bId; cur !== aId; ) {
     const p = prev.get(cur);
-    if (p == null) { return startId === goalId ? [startId] : null; }
+    if (p == null) return aId === bId ? [aId] : null;
     path.push(p);
     cur = p;
   }
@@ -58,42 +86,60 @@ export function pathBetween(graph, startId, goalId) {
   return path;
 }
 
-// Applicera fall s (t.ex. 0.01 = 1%) längs väg mellan A och B.
-// - A behåller sin y (högsta punkten).
-// - Varje nod i vägen får nytt y baserat på kumulativ horisontell sträcka från A.
-// - Om någon nod har lockedY, hoppar vi över att ändra den (enkel första version).
-export function applySlopeToPath(graph, startId, goalId, s /* 0.01 = 1% */) {
-  const path = pathBetween(graph, startId, goalId);
-  if (!path || path.length < 2) return { ok:false, reason:'no_path' };
+/**
+ * Preview av slope längs A→B:
+ *  • Starta på y_A.
+ *  • För varje path-segment:
+ *      - Δy_orig = y(b)_orig - y(a)_orig
+ *      - L_h = XZ-längd(a,b)
+ *      - Om |Δy_orig| < EPS  (horisontellt): y(b)* = y(a)* - s * L_h
+ *        Annars (vertikal/diagonal):         y(b)* = y(a)* + Δy_orig   (bevara höjdskillnaden)
+ *
+ * returnerar { ok, reason?, path, yTargetByNode: Map<nodeId,y>, affectedEdges: string[] }
+ */
+export function makeSlopePreviewOnPath(graph, aId, bId, s /* t.ex. 0.01 */) {
+  const path = pathCenterAB(graph, aId, bId);
+  if (!path) return { ok:false, reason:'no_path' };
 
-  const startNode = graph.getNode(startId);
-  if (!startNode) return { ok:false, reason:'bad_start' };
+  const aPos = getNodeWorldPos(graph, aId);
+  if (!aPos) return { ok:false, reason:'bad_A' };
 
-  // 1) kumulativa horisontella avstånd längs vägen
-  const cum = [0];
-  for (let i=0; i<path.length-1; i++) {
-    const a = graph.getNode(path[i]).pos;
-    const b = graph.getNode(path[i+1]).pos;
-    cum.push(cum[cum.length-1] + horizDist(a,b));
+  const yTargetByNode = new Map();
+  yTargetByNode.set(aId, aPos.y);
+
+  for (let i = 0; i < path.length - 1; i++) {
+    const idA = path[i], idB = path[i+1];
+    const pA = getNodeWorldPos(graph, idA);
+    const pB = getNodeWorldPos(graph, idB);
+
+    const dyOrig = pB.y - pA.y;
+    const Lh     = horizDistXZ(pA, pB);
+
+    const yAstar = yTargetByNode.get(idA);
+    const yBstar = (Math.abs(dyOrig) < EPS)
+      ? (yAstar - s * Lh)           // horisontell sträcka → applicera fall
+      : (yAstar + dyOrig);          // vertikal/diagonal → bevara original Δy
+
+    yTargetByNode.set(idB, yBstar);
   }
 
-  // 2) sätt nya y-värden
-  const yA = startNode.pos.y;
-  for (let i=0; i<path.length; i++) {
-    const nid = path[i];
-    const n = graph.getNode(nid);
-    if (!n) continue;
-    if (n.lockedY) continue; // hoppa över låsta
-    const yNew = yA - s * cum[i];
-    n.pos.y = yNew;
+  // berörda center-edges för uppdatering i scenen
+  const affected = new Set();
+  for (const nid of path) {
+    const set = graph.adj?.get(nid);
+    if (!set) continue;
+    for (const eid of set) {
+      const e = graph.edges.get(eid);
+      if (e && e.kind === 'center') affected.add(eid);
+    }
   }
 
-  // 3) Uppdatera Three-objekt i scenen (om du har sfärer för noder etc.)
-  //    Här visar vi bara hur du kan iterera; kopplingen gör du i din draw/scene kod.
-  //    T.ex.: uppdatera vertex-spheres och linjegeometrier från graph.nodes/edges.
+  return { ok:true, path, yTargetByNode, affectedEdges:[...affected] };
+}
 
-  // Tips: efter uppdatering
-  // state.draw.lineStartPoint kanske behöver reprojectas om du står i draw mode.
-  // Du kan även köra din iso-fit med "model-only" box (utan grid) om du vill.
-  return { ok:true, path };
+// ——— commit
+export function applySlopePreview(graph, preview) {
+  if (!preview?.ok) return { ok:false, reason:'no_preview' };
+  for (const [nid, y] of preview.yTargetByNode) setNodeWorldY(graph, nid, y);
+  return { ok:true, affectedEdges: preview.affectedEdges, path: preview.path };
 }
