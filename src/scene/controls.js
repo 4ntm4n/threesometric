@@ -3,7 +3,8 @@
 // ──────────────────────────────────────────────────────────────────────────────
 import { CameraControls, THREE } from '../platform/three.js';
 import { state } from '../state/appState.js';
-import { BASELINE_BOUNDS } from '../core/constants.js';
+// BASELINE_BOUNDS tas bort ur reset-fit (vi vill bara passa modellen)
+// import { BASELINE_BOUNDS } from '../core/constants.js';
 import { fitBoxOrthoIso } from './fit.js';
 
 export function createControls(camera, domElement) {
@@ -37,10 +38,33 @@ export function lookIsoAt({ controls, target, smooth = false }) {
   return controls.setLookAt(pos.x, pos.y, pos.z, target.x, target.y, target.z, smooth);
 }
 
-export async function resetIsoAndFitAll({ scene, modelGroup, controls, camera }) {
+/**
+ * Fit-to-screen för enbart användarens modell (linjer/vertices) – inte grid.
+ * Mindre padding för att inte zooma ut "för mycket".
+ */
+export async function resetIsoAndFitAll({ modelGroup, controls, camera }) {
+  // 1) Beräkna bbox från ENDAST modelGroup (grid ligger inte här)
   const modelBox = new THREE.Box3().setFromObject(modelGroup);
-  const fitBox = modelBox.isEmpty() ? BASELINE_BOUNDS.clone() : modelBox.union(BASELINE_BOUNDS.clone());
-  await fitBoxOrthoIso({ box: fitBox, controls, camera, paddingRatio: 0.08, smooth: true });
+
+  // 2) Fallback när modellen är tom → liten låda runt origo
+  let fitBox;
+  if (modelBox.isEmpty()) {
+    const R = 2; // litet neutralt område
+    fitBox = new THREE.Box3(
+      new THREE.Vector3(-R, -R, -R),
+      new THREE.Vector3( R,  R,  R)
+    );
+  } else {
+    // 3) Säkerhetsmarginal för extremt tunna boxar (undvik width/height≈0)
+    fitBox = modelBox.clone();
+    const EPS = 0.01; // litet påslag i world units
+    fitBox.expandByScalar(EPS);
+  }
+
+  // 4) Mindre padding än tidigare (0.04 istället för 0.08)
+  await fitBoxOrthoIso({ box: fitBox, controls, camera, paddingRatio: 0.04, smooth: true });
+
+  // 5) Gå till inspektionsläge (rotation på, dollyToCursor på)
   await enterInspectMode({ controls });
 }
 
@@ -54,7 +78,7 @@ export function enterInspectMode({ controls, runIsoFit=false }) {
   controls.enabled = true;
   const el = document.pointerLockElement;
   if (el) document.exitPointerLock();
-  if (state.ui.virtualCursor) state.ui.virtualCursor.style.display = 'none';
+  if (state.ui?.virtualCursor) state.ui.virtualCursor.style.display = 'none';
   return Promise.resolve();
 }
 

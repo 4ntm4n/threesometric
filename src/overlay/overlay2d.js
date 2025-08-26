@@ -1,6 +1,6 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// src/overlay/overlay2d.js
-// ──────────────────────────────────────────────────────────────────────────────
+// src/overlay/overlay2d.js  (clean, no hatching)
+// ─────────────────────────────────────────────────────────────────────────────-
 import { projectTo2D } from '../core/utils.js';
 import { state } from '../state/appState.js';
 
@@ -45,27 +45,43 @@ export function createOverlay2D() {
     ctx,
     get start2D() { return start2D; },
     get virtualCursorPix() { return virtualCursorPix; },
+
     recenterCursorToStart() {
       this.recomputeStart2D(state.draw.lineStartPoint);
       setVirtualCursorTo2D({ x: start2D.x, y: start2D.y });
     },
     setVirtualCursorTo2D,
+
     recomputeStart2D(worldPoint) {
       start2D = projectTo2D(state.camera, canvas, worldPoint);
     },
-    setSize(w,h) {
+
+    setSize(w, h) {
       canvas.width = w; canvas.height = h;
     },
+
     draw({ hasStart, isDrawing }) {
-      const { ctx } = this;
-      ctx.clearRect(0,0,canvas.width, canvas.height);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // startpunkt
       if (hasStart) {
         ctx.fillStyle = 'rgba(255,200,200,.9)';
-        ctx.beginPath(); ctx.arc(start2D.x, start2D.y, 3, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath();
+        ctx.arc(start2D.x, start2D.y, 3, 0, Math.PI * 2);
+        ctx.fill();
       }
+
+      // gummisnodd (streckad om konstruktionsläge)
       if (hasStart && isDrawing) {
-        ctx.strokeStyle = 'white'; ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(start2D.x, start2D.y); ctx.lineTo(virtualCursorPix.x, virtualCursorPix.y); ctx.stroke();
+        const dashed = !!state.draw?.isConstruction;
+        ctx.setLineDash(dashed ? [6, 4] : []);
+        ctx.strokeStyle = dashed ? '#9aa6b2' : 'white';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(start2D.x, start2D.y);
+        ctx.lineTo(virtualCursorPix.x, virtualCursorPix.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
       }
     }
   };

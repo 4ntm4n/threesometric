@@ -1,12 +1,14 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// src/main.js (Dirigent) – uses adapter
+// src/main.js (Dirigent) – graph-integrated via adapter
 // ──────────────────────────────────────────────────────────────────────────────
 import { THREE } from './platform/three.js';
 
+import { createGraph } from './model/graph.js';
+
 import { COLORS, FRUSTUM_SIZE, BASELINE_BOUNDS, ISO_ANGLES } from './core/constants.js';
 import { createScene } from './scene/createScene.js';
-import { createControls, lookIsoAt, enterDrawMode, enterInspectMode, resetIsoAndFitAll } from './scene/controls.js';
-import { fitBoxOrthoIso, computeIsoAnglesFromCamera } from './scene/fit.js';
+import { createControls, enterInspectMode, resetIsoAndFitAll } from './scene/controls.js';
+import { computeIsoAnglesFromCamera } from './scene/fit.js';
 import { createOverlay2D } from './overlay/overlay2d.js';
 import { createPicker } from './pick/picking.js';
 import { createSnapper } from './snap/snapper.js';
@@ -34,9 +36,11 @@ const picker = createPicker(scene);
 // Snapper (projektera noder till 2D och hitta närmaste)
 const snapper = createSnapper(camera, overlay.canvas, permanentVertices);
 
-// Draw manager
+// Graph (nodes/edges + adjacency)
+const graph = createGraph();
+
+// Draw manager (nu med grafen injicerad)
 const draw = createDrawManager({
-  THREE,
   scene,
   camera,
   renderer3D,
@@ -46,10 +50,24 @@ const draw = createDrawManager({
   snapper,
   modelGroup,
   permanentVertices,
+  graph, // <<< viktig
 });
 
 // Input
-installInputHandlers({ THREE, scene, camera, renderer3D, controls, overlay, picker, snapper, draw, modelGroup, permanentVertices, gridHelper, pickPlaneMesh });
+installInputHandlers({
+  scene,
+  camera,
+  renderer3D,
+  controls,
+  overlay,
+  picker,
+  snapper,
+  draw,
+  modelGroup,
+  permanentVertices,
+  gridHelper,
+  pickPlaneMesh
+});
 
 // Startläge: ISO-fit + inspektionsläge
 (async function init() {
@@ -69,3 +87,9 @@ function animate() {
   overlay.draw({ hasStart: state.draw.hasStart, isDrawing: state.draw.isDrawing });
 }
 animate();
+
+// (valfritt) Exponera för dev-inspektion i konsolen
+if (import.meta?.env?.DEV) {
+  // t.ex. window.sketch.graph.nodes / edges
+  window.sketch = { scene, camera, controls, draw, graph };
+}
