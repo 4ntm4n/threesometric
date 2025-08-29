@@ -1,5 +1,9 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// src/draw/drawManager.js  (adds slope mode: S to select A/B, Enter commit, Esc cancel)
+// src/draw/drawManager.js  (adds slope mode toggle: Tab cycles modes)
+//  • S: aktivera slope-läget, klicka A och B
+//  • Tab: toggla profil (balanced → lockTop → lockBottom → balanced …)
+//  • Enter: commit
+//  • Esc: cancel
 // ──────────────────────────────────────────────────────────────────────────────
 import { THREE } from '../platform/three.js';
 import { enterDrawMode, resetIsoAndFitAll } from '../scene/controls.js';
@@ -156,31 +160,33 @@ export function createDrawManager({
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // Slope-läge (S → välj A, B → preview, Enter commit, Esc cancel)
+  // Slope-läge (S → välj A, B → preview, Enter commit, Esc cancel, Tab toggle)
   // ───────────────────────────────────────────────────────────────────────────
   const slope = {
     active: false,
     stage: 0,        // 0=vänta på A, 1=vänta på B, 2=preview klar
     A: null,
     B: null,
-    preview: null,   // { ok, path, yTargetByNode, affectedEdges }
+    preview: null,   // { ok, path, yTargetByNode, affectedEdges, warnings? }
     group: new THREE.Group(),
     s: 0.01,         // 1%
+    mode: 'balanced',
+    modes: ['balanced','lockTop','lockBottom'],
   };
   slope.group.renderOrder = 3;
   scene.add(slope.group);
 
   function clearSlopePreview() {
     while (slope.group.children.length) slope.group.remove(slope.group.children[0]);
-    // slope.preview = null;
   }
 
   function toggleSlopeMode(on) {
     slope.active = on ?? !slope.active;
     slope.stage = slope.active ? 0 : 0;
     slope.A = slope.B = null;
+    slope.mode = 'balanced';      // reset vid nytt aktiverat läge
     clearSlopePreview();
-    slope.preview = null;   
+    slope.preview = null;
     setIdleMarkerColor(0xffffff);
   }
 
@@ -189,94 +195,152 @@ export function createDrawManager({
     return hit ? hit.id : null;
   }
 
+  // ——— Preview rendering
   function buildSlopePreview3D() {
-  clearSlopePreview();
-  if (!slope.preview?.ok) return;
+    clearSlopePreview();
+    if (!slope.preview?.ok) return;
 
-  // 🔶 gör preview tydlig
-  const previewBoost = 4;                 // förstora lutning i preview (visuellt)
-  const mat = new THREE.LineDashedMaterial({
-    color: 0xffa640,
-    dashSize: 0.5,
-    gapSize: 0.3,
-    transparent: true,
-    opacity: 1.0,
-    depthTest: false,
-    depthWrite: false,
-  });
+    // 🔶 gör preview tydlig
+    const previewBoost = 4; // förstora lutning i preview (endast visuellt)
+    const mat = new THREE.LineDashedMaterial({
+      color: 0xffa640,
+      dashSize: 0.5,
+      gapSize: 0.3,
+      transparent: true,
+      opacity: 1.0,
+      depthTest: false,
+      depthWrite: false,
+    });
 
-  const ids = slope.preview.path;
-  let made = 0;
+    const ids = slope.preview.path;
+    let made = 0;
 
-  for (let i = 0; i < ids.length - 1; i++) {
-    const na = graph.getNode(ids[i]);
-    const nb = graph.getNode(ids[i + 1]);
-    if (!na || !nb) continue;
+    for (let i = 0; i < ids.length - 1; i++) {
+      const na = graph.getNode(ids[i]);
+      const nb = graph.getNode(ids[i + 1]);
+      if (!na || !nb) continue;
 
-    const pa0 = nodeWorldPos(na);
-    const pb0 = nodeWorldPos(nb);
+      const pa0 = nodeWorldPos(na);
+      const pb0 = nodeWorldPos(nb);
 
-    // mål-Y från preview + lite boost (endast för visning)
-    const yA0 = slope.preview.yTargetByNode.get(ids[i])     ?? pa0.y;
-    const yB0 = slope.preview.yTargetByNode.get(ids[i + 1]) ?? pb0.y;
+      // mål-Y från preview + lite boost (endast för visning)
+      const yA0 = slope.preview.yTargetByNode.get(ids[i])     ?? pa0.y;
+      const yB0 = slope.preview.yTargetByNode.get(ids[i + 1]) ?? pb0.y;
 
-    // förstora avvikelse mot original en aning så det syns
-    const yA = pa0.y + (yA0 - pa0.y) * previewBoost;
-    const yB = pb0.y + (yB0 - pb0.y) * previewBoost;
+      const yA = pa0.y + (yA0 - pa0.y) * previewBoost;
+      const yB = pb0.y + (yB0 - pb0.y) * previewBoost;
 
-    const a = new THREE.Vector3(pa0.x, yA, pa0.z);
-    const b = new THREE.Vector3(pb0.x, yB, pb0.z);
+      const a = new THREE.Vector3(pa0.x, yA, pa0.z);
+      const b = new THREE.Vector3(pb0.x, yB, pb0.z);
 
-    const g = new THREE.BufferGeometry().setFromPoints([a, b]);
-    const l = new THREE.Line(g, mat);
-    if (l.computeLineDistances) l.computeLineDistances();   // krävs för dashed
-    l.renderOrder = 5;
-    slope.group.add(l);
-    made++;
+      const g = new THREE.BufferGeometry().setFromPoints([a, b]);
+      const l = new THREE.Line(g, mat);
+      if (l.computeLineDistances) l.computeLineDistances(); // krävs för dashed
+      l.renderOrder = 5;
+      slope.group.add(l);
+      made++;
+    }
+
+    // Visa nuvarande mode i konsolen (kan ersättas med HUD-chip om du vill)
+    console.info('[Slope] Mode:', slope.mode, 'Preview lines:', made, 'Warnings:', slope.preview.warnings ?? []);
   }
 
-  console.log('Slope preview lines made:', made);
-}
+  // ——— Mode-toggling & recompute
+  function cycleSlopeMode(dir = +1) {
+    const idx = slope.modes.indexOf(slope.mode);
+    const next = (idx + (dir >= 0 ? 1 : slope.modes.length - 1)) % slope.modes.length;
+    slope.mode = slope.modes[next];
+    console.info('[Slope] Mode →', slope.mode);
+  }
+
+  function recomputeSlopePreview() {
+    if (!slope.A || !slope.B) return;
+
+    // 1) Första försök: valt mode
+    let preview = makeSlopePreviewOnPath(graph, slope.A, slope.B, slope.s, { mode: slope.mode });
+
+    // 2) Smart fallback: balanced ej möjlig när A<=B → hoppa till lockBottom
+    if (!preview.ok && slope.mode === 'balanced' && /A_not_higher/i.test(preview.reason || '')) {
+      console.warn('[Slope] balanced ej möjligt (A måste vara högre) – byter till lockBottom');
+      slope.mode = 'lockBottom';
+      preview = makeSlopePreviewOnPath(graph, slope.A, slope.B, slope.s, { mode: slope.mode });
+    }
+
+    slope.preview = preview;
+    buildSlopePreview3D();
+  }
 
   function commitSlopeIfPreview() {
-    if (!slope.active || !slope.preview?.ok) return;
-    const res = applySlopePreview(graph, slope.preview);
-    if (!res.ok) return;
+  if (!slope.active || !slope.preview?.ok) return;
 
-    // 1) uppdatera 3D-geometrier för påverkade edges
-    for (const eid of res.affectedEdges) {
-      const e = graph.getEdge(eid);
-      if (!e) continue;
+  // 1) Skriv in slopen i grafen (inkl. 3D-coincident propagation) och få diffar
+  const res = applySlopePreview(graph, slope.preview);
+  if (!res.ok) return;
+
+  // 2) Uppdatera 3D-linjer för alla berörda center-edges
+  //    (construction-linjer uppdateras inte här – de är bara referens,
+  //     men deras pickables rebuildas i steg 4.)
+  for (const eid of res.affectedEdges) {
+    const e = graph.getEdge(eid);
+    if (!e) continue;
+    const la = graph.getNode(e.a);
+    const lb = graph.getNode(e.b);
+    if (!la || !lb) continue;
+
+    const pa = nodeWorldPos(la);
+    const pb = nodeWorldPos(lb);
+    const line = edgeIdToLine.get(eid);
+    if (line) {
+      const A = new THREE.Vector3(pa.x, pa.y, pa.z);
+      const B = new THREE.Vector3(pb.x, pb.y, pb.z);
+      line.geometry.setFromPoints([A, B]);
+      line.geometry.attributes.position.needsUpdate = true;
+      line.geometry.computeBoundingSphere?.();
+      // dashed-linjer ligger inte i denna map (de är construction)
+    }
+  }
+
+  // 3) Uppdatera nod-spheres för alla berörda noder (inte bara pathen)
+  const nodesToUpdate = res.affectedNodes ?? [];
+  for (const nid of nodesToUpdate) {
+    const n = graph.getNode(nid);
+    if (!n) continue;
+    const p = nodeWorldPos(n);
+    const sph = nodeIdToSphere.get(nid);
+    if (sph) sph.position.set(p.x, p.y, p.z);
+  }
+
+  // 4) REBUILD PICKABLES – rensa alla och bygg om från grafens aktuella geometri
+  //    (robustast nu; kan optimeras till per-edge senare)
+  while (picker.pickables.children.length) {
+    const obj = picker.pickables.children[0];
+    picker.pickables.remove(obj);
+    // Obs: vi låter material leva (kan vara delat); vill du, dispose:a geometry här:
+    // obj.geometry?.dispose?.();
+  }
+
+  if (graph?.edges?.size) {
+    for (const [eid, e] of graph.edges) {
       const la = graph.getNode(e.a);
       const lb = graph.getNode(e.b);
       if (!la || !lb) continue;
+
       const pa = nodeWorldPos(la);
       const pb = nodeWorldPos(lb);
-      const line = edgeIdToLine.get(eid);
-      if (line) {
-        const A = new THREE.Vector3(pa.x, pa.y, pa.z);
-        const B = new THREE.Vector3(pb.x, pb.y, pb.z);
-        line.geometry.setFromPoints([A, B]);
-        line.geometry.attributes.position.needsUpdate = true;
-        line.geometry.computeBoundingSphere();
-      }
-    }
 
-    // 2) uppdatera nod-spheres om vi har dem
-    if (slope.preview.path) {
-      for (const nid of slope.preview.path) {
-        const n = graph.getNode(nid);
-        const p = nodeWorldPos(n);
-        const sph = nodeIdToSphere.get(nid);
-        if (sph) sph.position.set(p.x, p.y, p.z);
-      }
-    }
+      const A = new THREE.Vector3(pa.x, pa.y, pa.z);
+      const B = new THREE.Vector3(pb.x, pb.y, pb.z);
 
-    // 3) rensa preview & lämna läget
-    clearSlopePreview();
-    slope.preview = null;            // <-- add this
-    toggleSlopeMode(false);
+      const pickCyl = picker.makePickCylinder(A, B);
+      if (pickCyl) picker.pickables.add(pickCyl);
+    }
   }
+
+  // 5) Städa preview och lämna slope-läget
+  clearSlopePreview();
+  slope.preview = null;
+  toggleSlopeMode(false);
+}
 
   // Pointer events
   function onMouseMove(e, pickPlaneMesh) {
@@ -347,20 +411,17 @@ export function createDrawManager({
       if (slope.stage === 1) {
         if (nid === slope.A) return;
         slope.B = nid;
-        // gör preview
-        slope.preview = makeSlopePreviewOnPath(graph, slope.A, slope.B, slope.s);
-        
-        const aPos = nodeWorldPos(graph.getNode(slope.A));
-const bPos = nodeWorldPos(graph.getNode(slope.B));
-console.log('Slope A→B', { A: slope.A, aPos, B: slope.B, bPos });
-console.log('Preview:', slope.preview);
 
-if (!slope.preview.ok) {
-  console.warn('Slope preview failed:', slope.preview.reason);
-  // Vanligaste orsaken: A och B saknar center-path (du råkade välja via construction).
-}
-        
-        buildSlopePreview3D();
+        // Gör preview med valt mode (ev. fallback)
+        const aPos = nodeWorldPos(graph.getNode(slope.A));
+        const bPos = nodeWorldPos(graph.getNode(slope.B));
+        console.log('Slope A→B', { A: slope.A, aPos, B: slope.B, bPos, mode: slope.mode, s: slope.s });
+
+        recomputeSlopePreview();
+        if (!slope.preview?.ok) {
+          console.warn('Slope preview failed:', slope.preview?.reason);
+          // Vanligaste orsaken: A och B saknar center-path (val gjord via construction).
+        }
         slope.stage = 2;
         return;
       }
@@ -418,12 +479,26 @@ if (!slope.preview.ok) {
     }
   }
 
+  function onKeyDown(e) {
+    // Hindra browserns Tab-fokusnavigering när vi är i slope-läget
+    if (slope.active && e.code === 'Tab') {
+      if (e.repeat) { e.preventDefault(); return; }  // undvik auto-repeat spam
+      e.preventDefault();
+      // Shift+Tab = bakåt
+      cycleSlopeMode(e.shiftKey ? -1 : +1);
+      if (slope.stage === 2) {
+        recomputeSlopePreview();
+      }
+      return;
+    }
+  }
+
   function onKeyUp(e, { resetIsoAndFitAll: reset }) {
     if (e.code === 'Escape') {
       // Avbryt slope-läge om aktivt
       if (slope.active) {
         clearSlopePreview();
-        slope.preview = null;   
+        slope.preview = null;
         toggleSlopeMode(false);
         return;
       }
@@ -455,6 +530,17 @@ if (!slope.preview.ok) {
       toggleSlopeMode();
       return;
     }
+
+    // TAB: toggla slope-mode när slope-läge är aktivt
+    // if (e.code === 'Tab' && slope.active) {
+    //   e.preventDefault();
+    //   // Shift+Tab = baklänges (valfritt, gratis)
+    //   cycleSlopeMode(e.shiftKey ? -1 : +1);
+    //   if (slope.stage === 2) {
+    //     recomputeSlopePreview();
+    //   }
+    //   return;
+    // }
   }
 
   function onPointerLockChange() {
@@ -494,6 +580,7 @@ if (!slope.preview.ok) {
     getStartPoint,
     onMouseMove,
     onPointerDown,
+    onKeyDown,
     onKeyUp,
     onPointerLockChange,
     onResize
