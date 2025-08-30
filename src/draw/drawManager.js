@@ -12,6 +12,10 @@ import { angleToIsoDir3D, pixelsPerWorldUnit, snapAngleDeg } from '../core/utils
 import { ISO_ANGLES, COLORS } from '../core/constants.js';
 import { makeSlopePreviewOnPath, applySlopePreview } from '../ops/slope.js';
 
+import { getSpecById, cycleSpec, PIPE_SPECS } from '../catalog/specs.js';
+import { createTopoOverlay } from '../debug/topoOverlay.js';
+
+
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
 }) {
@@ -23,7 +27,13 @@ export function createDrawManager({
   // Mappar för att kunna uppdatera 3D efter slope-commit
   const edgeIdToLine = new Map(); // endast center-edges
   const nodeIdToSphere = new Map();
-
+  const topoOverlay = createTopoOverlay({
+  graph,
+  nodeIdToSphere,
+  addVertexSphere,
+  nodeWorldPos,
+  COLORS
+});
   // Idle-markör (vit)
   const idleMarker = new THREE.Mesh(
     new THREE.SphereGeometry(0.2, 16, 8),
@@ -76,6 +86,14 @@ export function createDrawManager({
     const x = (v.x + 1) * 0.5 * canvas.width;
     const y = (-v.y + 1) * 0.5 * canvas.height;
     return (x>=marginPx && x<=canvas.width-marginPx && y>=marginPx && y<=canvas.height-marginPx);
+  }
+
+  function setCurrentSpec(id, { announce = true } = {}) {
+    const spec = getSpecById(id);
+    if (!spec) return false;
+    state.spec.current = spec.id;
+    if (announce) console.info(`[Spec] ${spec.id} (OD ${spec.od}×${spec.wt}, ${spec.material})`);
+    return true;
   }
 
   // ——— Förhands-ändpunkt
@@ -133,31 +151,48 @@ export function createDrawManager({
   }
 
   function commitIfAny() {
-    const { end3D, worldLen } = predictEndPoint();
-    if (worldLen <= 1e-6) return;
+  const { end3D, worldLen } = predictEndPoint();
+  if (worldLen <= 1e-6) return;
 
-    // 1) uppdatera graf
-    const kind = state.draw.isConstruction ? 'construction' : 'center';
-    const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
-    const { node: bNode } = graph.getOrCreateNodeAt(end3D);
-    const edge = graph.addEdge(aNode.id, bNode.id, kind);
+  // 1) uppdatera graf
+  const kind = state.draw.isConstruction ? 'construction' : 'center';
+  const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
+  const { node: bNode } = graph.getOrCreateNodeAt(end3D);
+  const edge = graph.addEdge(aNode.id, bNode.id, kind);
 
-    // 2) 3D-linje
-    const dashed = state.draw.isConstruction;
-    addModelLine(
-      new THREE.Vector3(state.draw.lineStartPoint.x, state.draw.lineStartPoint.y, state.draw.lineStartPoint.z),
-      new THREE.Vector3(end3D.x, end3D.y, end3D.z),
-      { dashed, edgeId: edge && edge.kind === 'center' ? edge.id : null }
-    );
-
-    // 3) nod-spheres
-    addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
-    addVertexSphere(end3D, bNode.id, COLORS.vertex);
-
-    // 4) fortsätt rita från slutpunkten
-    state.draw.lineStartPoint.copy(end3D);
-    overlay.recenterCursorToStart();
+  // Sätt rörspec på nya center-edges
+  if (edge && kind === 'center' && typeof graph.setEdgeSpec === 'function') {
+    const spec = getSpecById(state.spec.current);
+    if (spec) graph.setEdgeSpec(edge.id, spec);
   }
+
+  // Klassificera berörda noder (endast för center)
+  if (edge && kind === 'center' && typeof graph.classifyAndStoreMany === 'function') {
+    const near = new Set([aNode.id, bNode.id]);
+    for (const nid of [...near]) {
+      for (const { otherId } of graph.neighbors(nid, { kind: 'center' })) near.add(otherId);
+    }
+    graph.classifyAndStoreMany([...near]);
+    if (topoOverlay.isActive()) topoOverlay.update();
+  }
+
+  // 2) 3D-linje
+  const dashed = state.draw.isConstruction;
+  addModelLine(
+    new THREE.Vector3(state.draw.lineStartPoint.x, state.draw.lineStartPoint.y, state.draw.lineStartPoint.z),
+    new THREE.Vector3(end3D.x, end3D.y, end3D.z),
+    { dashed, edgeId: edge && edge.kind === 'center' ? edge.id : null }
+  );
+
+  // 3) nod-spheres
+  addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
+  addVertexSphere(end3D, bNode.id, COLORS.vertex);
+
+  // 4) fortsätt rita från slutpunkten
+  state.draw.lineStartPoint.copy(end3D);
+  overlay.recenterCursorToStart();
+}
+
 
   // ───────────────────────────────────────────────────────────────────────────
   // Slope-läge (S → välj A, B → preview, Enter commit, Esc cancel, Tab toggle)
@@ -191,8 +226,21 @@ export function createDrawManager({
   }
 
   function findGraphNodeIdNear(pos, tol = 1e-3) {
-    const hit = graph.findNodeNear(pos, tol);
-    return hit ? hit.id : null;
+    if (typeof graph.findNodeNear === 'function') {
+      const hit = graph.findNodeNear(pos, tol);
+      return hit ? hit.id : null;
+    }
+    // Fallback: skanna alla noder om API:t saknar findNodeNear
+    let bestId = null, bestD2 = tol * tol;
+    if (typeof graph.allNodes === 'function') {
+      for (const [nid, n] of graph.allNodes()) {
+        const p = nodeWorldPos(n);
+        const dx = p.x - pos.x, dy = p.y - pos.y, dz = p.z - pos.z;
+        const d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 <= bestD2) { bestD2 = d2; bestId = nid; }
+      }
+    }
+    return bestId;
   }
 
   // ——— Preview rendering
@@ -276,6 +324,14 @@ export function createDrawManager({
   // 1) Skriv in slopen i grafen (inkl. 3D-coincident propagation) och få diffar
   const res = applySlopePreview(graph, slope.preview);
   if (!res.ok) return;
+  
+  // Re-classify nodes that moved + their center neighbors
+  const affected = new Set(res.affectedNodes ?? []);
+  for (const nid of [...affected]) {
+    for (const { otherId } of graph.neighbors(nid, { kind:'center' })) affected.add(otherId);
+  }
+  graph.classifyAndStoreMany([...affected]);
+  if (topoOverlay.isActive()) topoOverlay.update();
 
   // 2) Uppdatera 3D-linjer för alla berörda center-edges
   //    (construction-linjer uppdateras inte här – de är bara referens,
@@ -490,6 +546,31 @@ export function createDrawManager({
         recomputeSlopePreview();
       }
       return;
+    }
+
+    if (!document.pointerLockElement && e.code === 'KeyD') {
+      e.preventDefault();
+      topoOverlay.toggle();
+      if (topoOverlay.isActive()) topoOverlay.update();
+      return;
+    }
+
+    // Byt rörspec när vi ritar (pointer lock på) – [ / ] cyklar, 1/2/3 väljer direkt
+    if (document.pointerLockElement) {
+      if (e.code === 'Period' || e.code === 'Comma') {
+        e.preventDefault();
+        const dir = e.code === 'Period' ? +1 : -1;
+        const nextId = cycleSpec(state.spec.current, dir);
+        setCurrentSpec(nextId);
+        return;
+      }
+      if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') {
+        e.preventDefault();
+        const idx = { Digit1: 0, Digit2: 1, Digit3: 2 }[e.code];
+        const id = PIPE_SPECS[idx]?.id;
+        if (id) setCurrentSpec(id);
+        return;
+      }
     }
   }
 
