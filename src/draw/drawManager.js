@@ -14,7 +14,8 @@ import { makeSlopePreviewOnPath, applySlopePreview } from '../ops/slope.js';
 
 import { getSpecById, cycleSpec, PIPE_SPECS } from '../catalog/specs.js';
 import { createTopoOverlay } from '../debug/topoOverlay.js';
-
+import { createJointOverlay } from '../debug/jointOverlay.js';
+import { evaluateNodeStress } from '../ops/stress.js';
 
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
@@ -28,12 +29,15 @@ export function createDrawManager({
   const edgeIdToLine = new Map(); // endast center-edges
   const nodeIdToSphere = new Map();
   const topoOverlay = createTopoOverlay({
-  graph,
-  nodeIdToSphere,
-  addVertexSphere,
-  nodeWorldPos,
-  COLORS
-});
+    graph,
+    nodeIdToSphere,
+    addVertexSphere,
+    nodeWorldPos,
+    COLORS
+  });
+  
+  const jointOverlay = createJointOverlay({ scene, graph });
+
   // Idle-markör (vit)
   const idleMarker = new THREE.Mesh(
     new THREE.SphereGeometry(0.2, 16, 8),
@@ -150,30 +154,38 @@ export function createDrawManager({
     return line;
   }
 
-  function commitIfAny() {
+function commitIfAny() {
   const { end3D, worldLen } = predictEndPoint();
   if (worldLen <= 1e-6) return;
 
-  // 1) uppdatera graf
+  // 1) Uppdatera graf
   const kind = state.draw.isConstruction ? 'construction' : 'center';
   const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
   const { node: bNode } = graph.getOrCreateNodeAt(end3D);
   const edge = graph.addEdge(aNode.id, bNode.id, kind);
 
-  // Sätt rörspec på nya center-edges
+  // 1.1) Spec för center-edges
   if (edge && kind === 'center' && typeof graph.setEdgeSpec === 'function') {
     const spec = getSpecById(state.spec.current);
     if (spec) graph.setEdgeSpec(edge.id, spec);
   }
 
-  // Klassificera berörda noder (endast för center)
+  // 1.2) Klassning + stress + overlays (endast center)
   if (edge && kind === 'center' && typeof graph.classifyAndStoreMany === 'function') {
     const near = new Set([aNode.id, bNode.id]);
     for (const nid of [...near]) {
-      for (const { otherId } of graph.neighbors(nid, { kind: 'center' })) near.add(otherId);
+      for (const { otherId } of graph.neighbors(nid, { kind:'center' })) near.add(otherId);
     }
-    graph.classifyAndStoreMany([...near]);
-    if (topoOverlay.isActive()) topoOverlay.update();
+    const nearArr = [...near];
+
+    graph.classifyAndStoreMany(nearArr);
+
+    //  Stress-koll på berörda noder + grannar
+    evaluateNodeStress(graph, nearArr);
+
+    //  Uppdatera overlays
+    if (topoOverlay?.isActive?.()) topoOverlay.update();
+    if (jointOverlay?.isActive?.()) jointOverlay.updateNodes(nearArr);
   }
 
   // 2) 3D-linje
@@ -192,7 +204,6 @@ export function createDrawManager({
   state.draw.lineStartPoint.copy(end3D);
   overlay.recenterCursorToStart();
 }
-
 
   // ───────────────────────────────────────────────────────────────────────────
   // Slope-läge (S → välj A, B → preview, Enter commit, Esc cancel, Tab toggle)
@@ -318,81 +329,70 @@ export function createDrawManager({
     buildSlopePreview3D();
   }
 
-  function commitSlopeIfPreview() {
+function commitSlopeIfPreview() {
   if (!slope.active || !slope.preview?.ok) return;
 
-  // 1) Skriv in slopen i grafen (inkl. 3D-coincident propagation) och få diffar
+  // 1) Skriv in slopen i grafen
   const res = applySlopePreview(graph, slope.preview);
   if (!res.ok) return;
-  
-  // Re-classify nodes that moved + their center neighbors
+
+  // 1.1) Bygg affected + center-grannar
   const affected = new Set(res.affectedNodes ?? []);
   for (const nid of [...affected]) {
-    for (const { otherId } of graph.neighbors(nid, { kind:'center' })) affected.add(otherId);
+    for (const { otherId } of graph.neighbors(nid, { kind:'center' })) {
+      affected.add(otherId);
+    }
   }
-  graph.classifyAndStoreMany([...affected]);
-  if (topoOverlay.isActive()) topoOverlay.update();
+  const affectedArr = [...affected];
 
-  // 2) Uppdatera 3D-linjer för alla berörda center-edges
-  //    (construction-linjer uppdateras inte här – de är bara referens,
-  //     men deras pickables rebuildas i steg 4.)
+  // 1.2) Re-class + stress
+  graph.classifyAndStoreMany(affectedArr);
+  evaluateNodeStress(graph, affectedArr);
+
+  // 1.3) Overlays
+  if (topoOverlay?.isActive?.()) topoOverlay.update();
+  if (jointOverlay?.isActive?.()) jointOverlay.updateNodes(affectedArr);
+
+  // 2) Uppdatera 3D-linjer (center-edges)
   for (const eid of res.affectedEdges) {
-    const e = graph.getEdge(eid);
-    if (!e) continue;
-    const la = graph.getNode(e.a);
-    const lb = graph.getNode(e.b);
-    if (!la || !lb) continue;
-
-    const pa = nodeWorldPos(la);
-    const pb = nodeWorldPos(lb);
+    const e = graph.getEdge(eid); if (!e) continue;
+    const pa = nodeWorldPos(graph.getNode(e.a));
+    const pb = nodeWorldPos(graph.getNode(e.b));
     const line = edgeIdToLine.get(eid);
     if (line) {
-      const A = new THREE.Vector3(pa.x, pa.y, pa.z);
-      const B = new THREE.Vector3(pb.x, pb.y, pb.z);
-      line.geometry.setFromPoints([A, B]);
+      line.geometry.setFromPoints([ new THREE.Vector3(pa.x, pa.y, pa.z),
+                                    new THREE.Vector3(pb.x, pb.y, pb.z) ]);
       line.geometry.attributes.position.needsUpdate = true;
       line.geometry.computeBoundingSphere?.();
-      // dashed-linjer ligger inte i denna map (de är construction)
     }
   }
 
-  // 3) Uppdatera nod-spheres för alla berörda noder (inte bara pathen)
-  const nodesToUpdate = res.affectedNodes ?? [];
-  for (const nid of nodesToUpdate) {
-    const n = graph.getNode(nid);
-    if (!n) continue;
+  // 3) Uppdatera nod-spheres
+  for (const nid of affectedArr) {
+    const n = graph.getNode(nid); if (!n) continue;
     const p = nodeWorldPos(n);
     const sph = nodeIdToSphere.get(nid);
     if (sph) sph.position.set(p.x, p.y, p.z);
   }
 
-  // 4) REBUILD PICKABLES – rensa alla och bygg om från grafens aktuella geometri
-  //    (robustast nu; kan optimeras till per-edge senare)
+  // 4) Rebuild pickables (robust)
   while (picker.pickables.children.length) {
     const obj = picker.pickables.children[0];
     picker.pickables.remove(obj);
-    // Obs: vi låter material leva (kan vara delat); vill du, dispose:a geometry här:
-    // obj.geometry?.dispose?.();
   }
-
   if (graph?.edges?.size) {
     for (const [eid, e] of graph.edges) {
-      const la = graph.getNode(e.a);
-      const lb = graph.getNode(e.b);
-      if (!la || !lb) continue;
-
-      const pa = nodeWorldPos(la);
-      const pb = nodeWorldPos(lb);
-
-      const A = new THREE.Vector3(pa.x, pa.y, pa.z);
-      const B = new THREE.Vector3(pb.x, pb.y, pb.z);
-
-      const pickCyl = picker.makePickCylinder(A, B);
+      const pa = nodeWorldPos(graph.getNode(e.a));
+      const pb = nodeWorldPos(graph.getNode(e.b));
+      const pickCyl = picker.makePickCylinder(
+        new THREE.Vector3(pa.x, pa.y, pa.z),
+        new THREE.Vector3(pb.x, pb.y, pb.z)
+      );
       if (pickCyl) picker.pickables.add(pickCyl);
     }
   }
 
-  // 5) Städa preview och lämna slope-läget
+  // 5) Städa preview & lämna läget
   clearSlopePreview();
   slope.preview = null;
   toggleSlopeMode(false);
@@ -547,11 +547,18 @@ export function createDrawManager({
       }
       return;
     }
-
+    //toggla debug läge, färgade nod-klot (D) i inspektionsläge
     if (!document.pointerLockElement && e.code === 'KeyD') {
       e.preventDefault();
       topoOverlay.toggle();
       if (topoOverlay.isActive()) topoOverlay.update();
+      return;
+    }
+    // Toggle "svetspunkter" (J) i inspektionsläge
+    if (!document.pointerLockElement && e.code === 'KeyJ') {
+      e.preventDefault();
+      jointOverlay.toggle();
+      if (jointOverlay.isActive()) jointOverlay.updateAll();
       return;
     }
 
@@ -612,16 +619,6 @@ export function createDrawManager({
       return;
     }
 
-    // TAB: toggla slope-mode när slope-läge är aktivt
-    // if (e.code === 'Tab' && slope.active) {
-    //   e.preventDefault();
-    //   // Shift+Tab = baklänges (valfritt, gratis)
-    //   cycleSlopeMode(e.shiftKey ? -1 : +1);
-    //   if (slope.stage === 2) {
-    //     recomputeSlopePreview();
-    //   }
-    //   return;
-    // }
   }
 
   function onPointerLockChange() {
