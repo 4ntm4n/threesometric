@@ -1,21 +1,26 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// src/draw/drawManager.js  (adds slope mode toggle: Tab cycles modes)
+// src/draw/drawManager.js
 //  • S: aktivera slope-läget, klicka A och B
 //  • Tab: toggla profil (balanced → lockTop → lockBottom → balanced …)
-//  • Enter: commit
+//  • Enter: commit (slope i stage 2)
 //  • Esc: cancel
 // ──────────────────────────────────────────────────────────────────────────────
 import { THREE } from '../platform/three.js';
-import { enterDrawMode, resetIsoAndFitAll } from '../scene/controls.js';
+import { resetIsoAndFitAll } from '../scene/controls.js';
 import { state } from '../state/appState.js';
-import { angleToIsoDir3D, pixelsPerWorldUnit, snapAngleDeg } from '../core/utils.js';
-import { ISO_ANGLES, COLORS } from '../core/constants.js';
-import { makeSlopePreviewOnPath, applySlopePreview } from '../ops/slope.js';
+import { COLORS } from '../core/constants.js';
 
-import { getSpecById, cycleSpec, PIPE_SPECS } from '../catalog/specs.js';
+import * as slopeTool from './tools/slope/index.js';
+import * as lineTool from './tools/line/index.js';
+import * as inspect from '../modes/inspect/index.js';
+
+import { getSpecById } from '../catalog/specs.js';
 import { createTopoOverlay } from '../debug/topoOverlay.js';
 import { createJointOverlay } from '../debug/jointOverlay.js';
-import { evaluateNodeStress } from '../ops/stress.js';
+
+import { nodeWorldPos } from '../graph/coords.js';
+
+import { isOnScreenPx } from '../core/camera.js';
 
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
@@ -28,6 +33,8 @@ export function createDrawManager({
   // Mappar för att kunna uppdatera 3D efter slope-commit
   const edgeIdToLine = new Map(); // endast center-edges
   const nodeIdToSphere = new Map();
+
+
   const topoOverlay = createTopoOverlay({
     graph,
     nodeIdToSphere,
@@ -35,7 +42,6 @@ export function createDrawManager({
     nodeWorldPos,
     COLORS
   });
-  
   const jointOverlay = createJointOverlay({ scene, graph });
 
   // Idle-markör (vit)
@@ -48,14 +54,35 @@ export function createDrawManager({
 
   function setIdleMarkerColor(hex) { idleMarker.material.color.setHex(hex); }
 
-  // Hjälpare: world-pos för graph-node oavsett lagringsmodell
-  function nodeWorldPos(n) {
-    if (!n) return { x:0,y:0,z:0 };
-    if (n.pos) return n.pos;
-    const b = n.base || {x:0,y:0,z:0};
-    const o = n.offset || {x:0,y:0,z:0};
-    return { x:(b.x??0)+(o.x??0), y:(b.y??0)+(o.y??0), z:(b.z??0)+(o.z??0) };
-  }
+  // ── Initiera verktyg/moder
+  slopeTool.init({
+    scene, graph, picker, snapper, nodeWorldPos,
+    edgeIdToLine, nodeIdToSphere, topoOverlay, jointOverlay,
+    setIdleMarkerColor, COLORS, idleMarker
+  });
+  lineTool.init({
+    camera, overlay, snapper,
+    graph, modelGroup, picker,
+    topoOverlay, jointOverlay,
+    nodeWorldPos, edgeIdToLine, nodeIdToSphere,
+    COLORS, addVertexSphere,
+    setCurrentSpec
+  });
+  inspect.init({
+  camera, renderer3D, overlay, picker, snapper, graph, controls,
+  nodeWorldPos, addVertexSphere, COLORS,
+  idleMarker, setIdleMarkerColor, topoOverlay, jointOverlay          // ← lägg till dessa två
+});
+
+  const {
+    slope,
+    clearSlopePreview,
+    toggleSlopeMode,
+    cycleSlopeMode,
+    recomputeSlopePreview,
+    commitSlopeIfPreview,
+    findGraphNodeIdNear
+  } = slopeTool;
 
   function addVertexSphere(pos, nodeId, color = COLORS.vertex) {
     // om vi redan har en sphere kopplad till noden → uppdatera istället
@@ -76,21 +103,6 @@ export function createDrawManager({
   // Public API
   function getStartPoint() { return state.draw.lineStartPoint; }
 
-  // Helpers
-  function getNDC(e) {
-    const rect = renderer3D.domElement.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-    const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-    return new THREE.Vector2(x, y);
-  }
-
-  function isOnScreenPx(camera, canvas, point3D, marginPx = 20) {
-    const v = point3D.clone().project(camera);
-    if (v.z < -1 || v.z > 1) return false;
-    const x = (v.x + 1) * 0.5 * canvas.width;
-    const y = (-v.y + 1) * 0.5 * canvas.height;
-    return (x>=marginPx && x<=canvas.width-marginPx && y>=marginPx && y<=canvas.height-marginPx);
-  }
 
   function setCurrentSpec(id, { announce = true } = {}) {
     const spec = getSpecById(id);
@@ -100,427 +112,39 @@ export function createDrawManager({
     return true;
   }
 
-  // ——— Förhands-ändpunkt
-  function predictEndPointAxis() {
-    const dx = overlay.virtualCursorPix.x - overlay.start2D.x;
-    const dy = overlay.start2D.y - overlay.virtualCursorPix.y;
-    const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
-    const snapped = snapAngleDeg(rawAngle, ISO_ANGLES);
-    const dir3D = angleToIsoDir3D(snapped);
-    const ppu = pixelsPerWorldUnit(camera, overlay.canvas, dir3D, state.draw.lineStartPoint);
-    const pixelsLen = Math.hypot(dx, dy);
-    const worldLen = pixelsLen / ppu;
-    const end3D = state.draw.lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
-    return { end3D, worldLen, snappedToNode: false };
-  }
-
-  function predictEndPointNormal() {
-    const snapPos = snapper.findNearestNode2D(overlay.virtualCursorPix.x, overlay.virtualCursorPix.y);
-    if (snapPos && snapPos.distanceToSquared(state.draw.lineStartPoint) > 1e-10) {
-      const end3D = snapPos.clone();
-      const worldLen = Math.sqrt(state.draw.lineStartPoint.distanceToSquared(end3D));
-      return { end3D, worldLen, snappedToNode: true };
-    }
-    return predictEndPointAxis();
-  }
-
-  function predictEndPoint() {
-    return state.draw.isConstruction ? predictEndPointAxis() : predictEndPointNormal();
-  }
-
-  function addModelLine(a, b, { dashed = false, edgeId = null } = {}) {
-    const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
-    const mat = dashed
-      ? new THREE.LineDashedMaterial({
-          color: 0x9aa6b2,
-          dashSize: 0.35,
-          gapSize: 0.22,
-          transparent: true,
-          opacity: 0.95,
-          depthTest: false,
-          depthWrite: false,
-        })
-      : new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false });
-
-    const line = new THREE.Line(geom, mat);
-    if (dashed && line.computeLineDistances) line.computeLineDistances();
-    line.renderOrder = 1;
-    modelGroup.add(line);
-
-    if (!dashed && edgeId) edgeIdToLine.set(edgeId, line);
-
-    const pickCyl = picker.makePickCylinder(a, b);
-    if (pickCyl) picker.pickables.add(pickCyl);
-    return line;
-  }
-
-function commitIfAny() {
-  const { end3D, worldLen } = predictEndPoint();
-  if (worldLen <= 1e-6) return;
-
-  // 1) Uppdatera graf
-  const kind = state.draw.isConstruction ? 'construction' : 'center';
-  const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
-  const { node: bNode } = graph.getOrCreateNodeAt(end3D);
-  const edge = graph.addEdge(aNode.id, bNode.id, kind);
-
-  // 1.1) Spec för center-edges
-  if (edge && kind === 'center' && typeof graph.setEdgeSpec === 'function') {
-    const spec = getSpecById(state.spec.current);
-    if (spec) graph.setEdgeSpec(edge.id, spec);
-  }
-
-  // 1.2) Klassning + stress + overlays (endast center)
-  if (edge && kind === 'center' && typeof graph.classifyAndStoreMany === 'function') {
-    const near = new Set([aNode.id, bNode.id]);
-    for (const nid of [...near]) {
-      for (const { otherId } of graph.neighbors(nid, { kind:'center' })) near.add(otherId);
-    }
-    const nearArr = [...near];
-
-    graph.classifyAndStoreMany(nearArr);
-
-    //  Stress-koll på berörda noder + grannar
-    evaluateNodeStress(graph, nearArr);
-
-    //  Uppdatera overlays
-    if (topoOverlay?.isActive?.()) topoOverlay.update();
-    if (jointOverlay?.isActive?.()) jointOverlay.updateNodes(nearArr);
-  }
-
-  // 2) 3D-linje
-  const dashed = state.draw.isConstruction;
-  addModelLine(
-    new THREE.Vector3(state.draw.lineStartPoint.x, state.draw.lineStartPoint.y, state.draw.lineStartPoint.z),
-    new THREE.Vector3(end3D.x, end3D.y, end3D.z),
-    { dashed, edgeId: edge && edge.kind === 'center' ? edge.id : null }
-  );
-
-  // 3) nod-spheres
-  addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
-  addVertexSphere(end3D, bNode.id, COLORS.vertex);
-
-  // 4) fortsätt rita från slutpunkten
-  state.draw.lineStartPoint.copy(end3D);
-  overlay.recenterCursorToStart();
-}
-
-  // ───────────────────────────────────────────────────────────────────────────
-  // Slope-läge (S → välj A, B → preview, Enter commit, Esc cancel, Tab toggle)
-  // ───────────────────────────────────────────────────────────────────────────
-  const slope = {
-    active: false,
-    stage: 0,        // 0=vänta på A, 1=vänta på B, 2=preview klar
-    A: null,
-    B: null,
-    preview: null,   // { ok, path, yTargetByNode, affectedEdges, warnings? }
-    group: new THREE.Group(),
-    s: 0.01,         // 1%
-    mode: 'balanced',
-    modes: ['balanced','lockTop','lockBottom'],
-  };
-  slope.group.renderOrder = 3;
-  scene.add(slope.group);
-
-  function clearSlopePreview() {
-    while (slope.group.children.length) slope.group.remove(slope.group.children[0]);
-  }
-
-  function toggleSlopeMode(on) {
-    slope.active = on ?? !slope.active;
-    slope.stage = slope.active ? 0 : 0;
-    slope.A = slope.B = null;
-    slope.mode = 'balanced';      // reset vid nytt aktiverat läge
-    clearSlopePreview();
-    slope.preview = null;
-    setIdleMarkerColor(0xffffff);
-  }
-
-  function findGraphNodeIdNear(pos, tol = 1e-3) {
-    if (typeof graph.findNodeNear === 'function') {
-      const hit = graph.findNodeNear(pos, tol);
-      return hit ? hit.id : null;
-    }
-    // Fallback: skanna alla noder om API:t saknar findNodeNear
-    let bestId = null, bestD2 = tol * tol;
-    if (typeof graph.allNodes === 'function') {
-      for (const [nid, n] of graph.allNodes()) {
-        const p = nodeWorldPos(n);
-        const dx = p.x - pos.x, dy = p.y - pos.y, dz = p.z - pos.z;
-        const d2 = dx*dx + dy*dy + dz*dz;
-        if (d2 <= bestD2) { bestD2 = d2; bestId = nid; }
-      }
-    }
-    return bestId;
-  }
-
-  // ——— Preview rendering
-  function buildSlopePreview3D() {
-    clearSlopePreview();
-    if (!slope.preview?.ok) return;
-
-    // 🔶 gör preview tydlig
-    const previewBoost = 4; // förstora lutning i preview (endast visuellt)
-    const mat = new THREE.LineDashedMaterial({
-      color: 0xffa640,
-      dashSize: 0.5,
-      gapSize: 0.3,
-      transparent: true,
-      opacity: 1.0,
-      depthTest: false,
-      depthWrite: false,
-    });
-
-    const ids = slope.preview.path;
-    let made = 0;
-
-    for (let i = 0; i < ids.length - 1; i++) {
-      const na = graph.getNode(ids[i]);
-      const nb = graph.getNode(ids[i + 1]);
-      if (!na || !nb) continue;
-
-      const pa0 = nodeWorldPos(na);
-      const pb0 = nodeWorldPos(nb);
-
-      // mål-Y från preview + lite boost (endast för visning)
-      const yA0 = slope.preview.yTargetByNode.get(ids[i])     ?? pa0.y;
-      const yB0 = slope.preview.yTargetByNode.get(ids[i + 1]) ?? pb0.y;
-
-      const yA = pa0.y + (yA0 - pa0.y) * previewBoost;
-      const yB = pb0.y + (yB0 - pb0.y) * previewBoost;
-
-      const a = new THREE.Vector3(pa0.x, yA, pa0.z);
-      const b = new THREE.Vector3(pb0.x, yB, pb0.z);
-
-      const g = new THREE.BufferGeometry().setFromPoints([a, b]);
-      const l = new THREE.Line(g, mat);
-      if (l.computeLineDistances) l.computeLineDistances(); // krävs för dashed
-      l.renderOrder = 5;
-      slope.group.add(l);
-      made++;
-    }
-
-    // Visa nuvarande mode i konsolen (kan ersättas med HUD-chip om du vill)
-    console.info('[Slope] Mode:', slope.mode, 'Preview lines:', made, 'Warnings:', slope.preview.warnings ?? []);
-  }
-
-  // ——— Mode-toggling & recompute
-  function cycleSlopeMode(dir = +1) {
-    const idx = slope.modes.indexOf(slope.mode);
-    const next = (idx + (dir >= 0 ? 1 : slope.modes.length - 1)) % slope.modes.length;
-    slope.mode = slope.modes[next];
-    console.info('[Slope] Mode →', slope.mode);
-  }
-
-  function recomputeSlopePreview() {
-    if (!slope.A || !slope.B) return;
-
-    // 1) Första försök: valt mode
-    let preview = makeSlopePreviewOnPath(graph, slope.A, slope.B, slope.s, { mode: slope.mode });
-
-    // 2) Smart fallback: balanced ej möjlig när A<=B → hoppa till lockBottom
-    if (!preview.ok && slope.mode === 'balanced' && /A_not_higher/i.test(preview.reason || '')) {
-      console.warn('[Slope] balanced ej möjligt (A måste vara högre) – byter till lockBottom');
-      slope.mode = 'lockBottom';
-      preview = makeSlopePreviewOnPath(graph, slope.A, slope.B, slope.s, { mode: slope.mode });
-    }
-
-    slope.preview = preview;
-    buildSlopePreview3D();
-  }
-
-function commitSlopeIfPreview() {
-  if (!slope.active || !slope.preview?.ok) return;
-
-  // 1) Skriv in slopen i grafen
-  const res = applySlopePreview(graph, slope.preview);
-  if (!res.ok) return;
-
-  // 1.1) Bygg affected + center-grannar
-  const affected = new Set(res.affectedNodes ?? []);
-  for (const nid of [...affected]) {
-    for (const { otherId } of graph.neighbors(nid, { kind:'center' })) {
-      affected.add(otherId);
-    }
-  }
-  const affectedArr = [...affected];
-
-  // 1.2) Re-class + stress
-  graph.classifyAndStoreMany(affectedArr);
-  evaluateNodeStress(graph, affectedArr);
-
-  // 1.3) Overlays
-  if (topoOverlay?.isActive?.()) topoOverlay.update();
-  if (jointOverlay?.isActive?.()) jointOverlay.updateNodes(affectedArr);
-
-  // 2) Uppdatera 3D-linjer (center-edges)
-  for (const eid of res.affectedEdges) {
-    const e = graph.getEdge(eid); if (!e) continue;
-    const pa = nodeWorldPos(graph.getNode(e.a));
-    const pb = nodeWorldPos(graph.getNode(e.b));
-    const line = edgeIdToLine.get(eid);
-    if (line) {
-      line.geometry.setFromPoints([ new THREE.Vector3(pa.x, pa.y, pa.z),
-                                    new THREE.Vector3(pb.x, pb.y, pb.z) ]);
-      line.geometry.attributes.position.needsUpdate = true;
-      line.geometry.computeBoundingSphere?.();
-    }
-  }
-
-  // 3) Uppdatera nod-spheres
-  for (const nid of affectedArr) {
-    const n = graph.getNode(nid); if (!n) continue;
-    const p = nodeWorldPos(n);
-    const sph = nodeIdToSphere.get(nid);
-    if (sph) sph.position.set(p.x, p.y, p.z);
-  }
-
-  // 4) Rebuild pickables (robust)
-  while (picker.pickables.children.length) {
-    const obj = picker.pickables.children[0];
-    picker.pickables.remove(obj);
-  }
-  if (graph?.edges?.size) {
-    for (const [eid, e] of graph.edges) {
-      const pa = nodeWorldPos(graph.getNode(e.a));
-      const pb = nodeWorldPos(graph.getNode(e.b));
-      const pickCyl = picker.makePickCylinder(
-        new THREE.Vector3(pa.x, pa.y, pa.z),
-        new THREE.Vector3(pb.x, pb.y, pb.z)
-      );
-      if (pickCyl) picker.pickables.add(pickCyl);
-    }
-  }
-
-  // 5) Städa preview & lämna läget
-  clearSlopePreview();
-  slope.preview = null;
-  toggleSlopeMode(false);
-}
-
   // Pointer events
-  function onMouseMove(e, pickPlaneMesh) {
-    if (document.pointerLockElement) {
-      if (state.draw.isDrawing && state.draw.hasStart) {
-        overlay.setVirtualCursorTo2D({
-          x: overlay.virtualCursorPix.x + e.movementX,
-          y: overlay.virtualCursorPix.y + e.movementY
-        });
-      }
-      return;
+ function onMouseMove(e, pickPlaneMesh) {
+  if (document.pointerLockElement) {
+    if (state.draw.isDrawing && state.draw.hasStart) {
+      overlay.setVirtualCursorTo2D({
+        x: overlay.virtualCursorPix.x + e.movementX,
+        y: overlay.virtualCursorPix.y + e.movementY
+      });
     }
-
-    // Slope-läge: visa idleMarker på närmaste nod vi kan snappa till
-    if (slope.active) {
-      const nodeSnapPos = snapper.findNearestNode2D(e.clientX, e.clientY);
-      if (nodeSnapPos) {
-        idleMarker.position.copy(nodeSnapPos);
-        setIdleMarkerColor(0xffa640);
-      } else {
-        setIdleMarkerColor(0xffffff);
-      }
-      return;
-    }
-
-    // INSPEKTION (vanlig hover)
-    const nodeSnapPos = snapper.findNearestNode2D(e.clientX, e.clientY);
-    if (nodeSnapPos) {
-      idleMarker.position.copy(nodeSnapPos);
-      setIdleMarkerColor(0x80ff80);
-      return;
-    } else {
-      setIdleMarkerColor(0xffffff);
-    }
-
-    const ndc = getNDC(e);
-    picker.raycaster.setFromCamera(ndc, camera);
-
-    const hits = picker.raycaster.intersectObjects(picker.pickables.children, false);
-    if (hits.length > 0) {
-      const hit = hits[0];
-      const seg = hit.object.userData;
-      const nearest = picker.closestPointOnSegment(hit.point, seg.start, seg.end);
-      idleMarker.position.copy(nearest);
-      return;
-    }
-
-    const hit = picker.raycaster.intersectObject(pickPlaneMesh);
-    if (hit.length) idleMarker.position.copy(hit[0].point);
+    return; // inget hover i draw-läge
   }
 
+  if (slope.active) {
+    return slopeTool.handleHover(e); // orange hover i slope-läge
+  }
+
+  return inspect.handleHover(e, pickPlaneMesh); // grön hover i inspektionsläge
+}
   function onPointerDown(e, pickPlaneMesh) {
     if (e.button !== 0) return;
 
     // Slope-läge (ingen pointer-lock)
     if (slope.active && !document.pointerLockElement) {
-      const pos = snapper.findNearestNode2D(e.clientX, e.clientY);
-      if (!pos) return;
-
-      const nid = findGraphNodeIdNear(pos, 1e-3);
-      if (!nid) return;
-
-      if (slope.stage === 0) {
-        slope.A = nid;
-        slope.stage = 1;
-        return;
-      }
-      if (slope.stage === 1) {
-        if (nid === slope.A) return;
-        slope.B = nid;
-
-        // Gör preview med valt mode (ev. fallback)
-        const aPos = nodeWorldPos(graph.getNode(slope.A));
-        const bPos = nodeWorldPos(graph.getNode(slope.B));
-        console.log('Slope A→B', { A: slope.A, aPos, B: slope.B, bPos, mode: slope.mode, s: slope.s });
-
-        recomputeSlopePreview();
-        if (!slope.preview?.ok) {
-          console.warn('Slope preview failed:', slope.preview?.reason);
-          // Vanligaste orsaken: A och B saknar center-path (val gjord via construction).
-        }
-        slope.stage = 2;
-        return;
-      }
-      // stage 2: låt Enter committa / Esc avbryta
-      return;
+      return slopeTool.onPointerDown(e);
     }
-
-    // Vanlig ritlogik (inspektion → välj start → draw mode)
+    
+    // Vanlig inspektionsklick → starta ritning
     if (!document.pointerLockElement) {
-      const nodeSnapPos = snapper.findNearestNode2D(e.clientX, e.clientY);
-      if (nodeSnapPos) {
-        state.draw.lineStartPoint.copy(nodeSnapPos);
-        // koppla startpunkten till grafen om den saknas
-        const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
-        addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
-        return enterDrawMode({ controls, startPoint: state.draw.lineStartPoint });
-      }
-
-      const ndc = getNDC(e);
-      picker.raycaster.setFromCamera(ndc, camera);
-
-      const hits = picker.raycaster.intersectObjects(picker.pickables.children, false);
-      if (hits.length > 0) {
-        const hit = hits[0];
-        const seg = hit.object.userData;
-        const nearest = picker.closestPointOnSegment(hit.point, seg.start, seg.end);
-        state.draw.lineStartPoint.copy(nearest);
-        const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
-        addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
-        return enterDrawMode({ controls, startPoint: state.draw.lineStartPoint });
-      }
-
-      const hit = picker.raycaster.intersectObject(pickPlaneMesh);
-      if (hit.length) {
-        state.draw.lineStartPoint.copy(hit[0].point);
-        const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
-        addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
-        return enterDrawMode({ controls, startPoint: state.draw.lineStartPoint });
-      }
+      return inspect.handlePointerDown(e, pickPlaneMesh);
     } else {
       // RITLÄGE: två-klicks
       if (state.draw.isDrawing && state.draw.hasStart && !state.draw.isInteracting) {
-        const { end3D, worldLen } = predictEndPoint();
+        const { end3D, worldLen } = lineTool.predictEndPoint();
         if (worldLen <= 1e-6) return;
 
         const visible = isOnScreenPx(camera, overlay.canvas, end3D, 20);
@@ -530,54 +154,25 @@ function commitSlopeIfPreview() {
           controls.setLookAt(pos.x, pos.y, pos.z, target.x, target.y, target.z, true);
           return; // första klicket: bara pan
         }
-        commitIfAny();
+        lineTool.commitIfAny();
       }
     }
   }
 
   function onKeyDown(e) {
     // Hindra browserns Tab-fokusnavigering när vi är i slope-läget
-    if (slope.active && e.code === 'Tab') {
-      if (e.repeat) { e.preventDefault(); return; }  // undvik auto-repeat spam
-      e.preventDefault();
-      // Shift+Tab = bakåt
-      cycleSlopeMode(e.shiftKey ? -1 : +1);
-      if (slope.stage === 2) {
-        recomputeSlopePreview();
-      }
-      return;
-    }
-    //toggla debug läge, färgade nod-klot (D) i inspektionsläge
-    if (!document.pointerLockElement && e.code === 'KeyD') {
-      e.preventDefault();
-      topoOverlay.toggle();
-      if (topoOverlay.isActive()) topoOverlay.update();
-      return;
-    }
-    // Toggle "svetspunkter" (J) i inspektionsläge
-    if (!document.pointerLockElement && e.code === 'KeyJ') {
-      e.preventDefault();
-      jointOverlay.toggle();
-      if (jointOverlay.isActive()) jointOverlay.updateAll();
-      return;
+    if (slope.active) {
+      if (slopeTool.onKeyDown(e)) return;
     }
 
-    // Byt rörspec när vi ritar (pointer lock på) – [ / ] cyklar, 1/2/3 väljer direkt
+    // Debug toggles i inspektionsläge
+    if (!document.pointerLockElement) {
+      if (inspect.handleKeyDown?.(e)) return;
+    }
+
+    // Ritläge: låt lineTool hantera spec-tangenterna
     if (document.pointerLockElement) {
-      if (e.code === 'Period' || e.code === 'Comma') {
-        e.preventDefault();
-        const dir = e.code === 'Period' ? +1 : -1;
-        const nextId = cycleSpec(state.spec.current, dir);
-        setCurrentSpec(nextId);
-        return;
-      }
-      if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') {
-        e.preventDefault();
-        const idx = { Digit1: 0, Digit2: 1, Digit3: 2 }[e.code];
-        const id = PIPE_SPECS[idx]?.id;
-        if (id) setCurrentSpec(id);
-        return;
-      }
+      if (lineTool.handleKeyDown?.(e)) return;
     }
   }
 
@@ -600,12 +195,6 @@ function commitSlopeIfPreview() {
       return;
     }
 
-    if (e.code === 'Enter') {
-      if (slope.active && slope.stage === 2 && slope.preview?.ok) {
-        commitSlopeIfPreview();
-        return;
-      }
-    }
 
     // Toggle konstruktionsläge i ritläge
     if (e.code === 'KeyG' && document.pointerLockElement) {
@@ -618,7 +207,6 @@ function commitSlopeIfPreview() {
       toggleSlopeMode();
       return;
     }
-
   }
 
   function onPointerLockChange() {

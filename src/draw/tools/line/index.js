@@ -1,0 +1,162 @@
+//src/draw/tools/line/index.js
+import { angleToIsoDir3D, pixelsPerWorldUnit, snapAngleDeg } from '../../../core/utils.js'
+import { ISO_ANGLES } from '../../../core/constants.js'
+import { state } from '../../../state/appState.js'
+import { THREE } from '../../../platform/three.js';
+import { getSpecById } from '../../../catalog/specs.js';
+import { evaluateNodeStress } from '../../../ops/stress.js';
+import { cycleSpec, PIPE_SPECS } from '../../../catalog/specs.js'
+
+
+let camera, overlay, snapper,
+    graph, modelGroup, picker,
+    topoOverlay, jointOverlay,
+    nodeWorldPos, edgeIdToLine, nodeIdToSphere,
+    COLORS, addVertexSphere, setCurrentSpec;
+
+export function init(ctx){
+  camera = ctx.camera;
+  overlay = ctx.overlay;
+  snapper = ctx.snapper;
+
+  graph = ctx.graph;
+  modelGroup = ctx.modelGroup;
+  picker = ctx.picker;
+  topoOverlay = ctx.topoOverlay;
+  jointOverlay = ctx.jointOverlay;
+
+  nodeWorldPos = ctx.nodeWorldPos;
+  edgeIdToLine = ctx.edgeIdToLine;
+  nodeIdToSphere = ctx.nodeIdToSphere;
+  setCurrentSpec = ctx.setCurrentSpec;
+
+  COLORS = ctx.COLORS;
+  addVertexSphere = ctx.addVertexSphere;
+}
+
+//preview line
+function predictEndPointAxis() {
+    const dx = overlay.virtualCursorPix.x - overlay.start2D.x;
+    const dy = overlay.start2D.y - overlay.virtualCursorPix.y;
+    const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
+    const snapped = snapAngleDeg(rawAngle, ISO_ANGLES);
+    const dir3D = angleToIsoDir3D(snapped);
+    const ppu = pixelsPerWorldUnit(camera, overlay.canvas, dir3D, state.draw.lineStartPoint);
+    const pixelsLen = Math.hypot(dx, dy);
+    const worldLen = pixelsLen / ppu;
+    const end3D = state.draw.lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
+    return { end3D, worldLen, snappedToNode: false };
+}
+
+function predictEndPointNormal() {
+    const snapPos = snapper.findNearestNode2D(overlay.virtualCursorPix.x, overlay.virtualCursorPix.y);
+    if (snapPos && snapPos.distanceToSquared(state.draw.lineStartPoint) > 1e-10) {
+      const end3D = snapPos.clone();
+      const worldLen = Math.sqrt(state.draw.lineStartPoint.distanceToSquared(end3D));
+      return { end3D, worldLen, snappedToNode: true };
+    }
+    return predictEndPointAxis();
+}
+
+export function predictEndPoint() {
+    return state.draw.isConstruction ? predictEndPointAxis() : predictEndPointNormal();
+}
+
+//pointer events
+function addModelLine(a, b, { dashed = false, edgeId = null } = {}) {
+const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
+const mat = dashed
+    ? new THREE.LineDashedMaterial({
+        color: 0x9aa6b2,
+        dashSize: 0.35,
+        gapSize: 0.22,
+        transparent: true,
+        opacity: 0.95,
+        depthTest: false,
+        depthWrite: false,
+    })
+    : new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false });
+
+const line = new THREE.Line(geom, mat);
+if (dashed && line.computeLineDistances) line.computeLineDistances();
+line.renderOrder = 1;
+modelGroup.add(line);
+
+if (!dashed && edgeId) edgeIdToLine.set(edgeId, line);
+
+const pickCyl = picker.makePickCylinder(a, b);
+if (pickCyl) picker.pickables.add(pickCyl);
+return line;
+}
+
+export function commitIfAny() {
+  const { end3D, worldLen } = predictEndPoint();
+  if (worldLen <= 1e-6) return;
+
+  // 1) Uppdatera graf
+  const kind = state.draw.isConstruction ? 'construction' : 'center';
+  const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
+  const { node: bNode } = graph.getOrCreateNodeAt(end3D);
+  const edge = graph.addEdge(aNode.id, bNode.id, kind);
+
+  // 1.1) Spec för center-edges
+  if (edge && kind === 'center' && typeof graph.setEdgeSpec === 'function') {
+    const spec = getSpecById(state.spec.current);
+    if (spec) graph.setEdgeSpec(edge.id, spec);
+  }
+
+  // 1.2) Klassning + stress + overlays (endast center)
+  if (edge && kind === 'center' && typeof graph.classifyAndStoreMany === 'function') {
+    const near = new Set([aNode.id, bNode.id]);
+    for (const nid of [...near]) {
+      for (const { otherId } of graph.neighbors(nid, { kind:'center' })) near.add(otherId);
+    }
+    const nearArr = [...near];
+
+    graph.classifyAndStoreMany(nearArr);
+
+    //  Stress-koll på berörda noder + grannar
+    evaluateNodeStress(graph, nearArr);
+
+    //  Uppdatera overlays
+    if (topoOverlay?.isActive?.()) topoOverlay.update();
+    if (jointOverlay?.isActive?.()) jointOverlay.updateNodes(nearArr);
+  }
+
+  // 2) 3D-linje
+  const dashed = state.draw.isConstruction;
+  addModelLine(
+    new THREE.Vector3(state.draw.lineStartPoint.x, state.draw.lineStartPoint.y, state.draw.lineStartPoint.z),
+    new THREE.Vector3(end3D.x, end3D.y, end3D.z),
+    { dashed, edgeId: edge && edge.kind === 'center' ? edge.id : null }
+  );
+
+  // 3) nod-spheres
+  addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
+  addVertexSphere(end3D, bNode.id, COLORS.vertex);
+
+  // 4) fortsätt rita från slutpunkten
+  state.draw.lineStartPoint.copy(end3D);
+  overlay.recenterCursorToStart();
+}
+
+//toggla mellan olika rörspecifikationer (just nu mockdata)
+export function handleKeyDown(e){
+  // , .  (cycle spec)
+  if (e.code === 'Period' || e.code === 'Comma') {
+    e.preventDefault();
+    const dir = e.code === 'Period' ? +1 : -1;
+    const nextId = cycleSpec(state.spec.current, dir);
+    if (nextId) setCurrentSpec(nextId);
+    return true;
+  }
+  // 1 / 2 / 3 (direct select)
+  if (e.code === 'Digit1' || e.code === 'Digit2' || e.code === 'Digit3') {
+    e.preventDefault();
+    const idx = { Digit1: 0, Digit2: 1, Digit3: 2 }[e.code];
+    const id = PIPE_SPECS[idx]?.id;
+    if (id) setCurrentSpec(id);
+    return true;
+  }
+  return false;
+}
