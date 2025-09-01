@@ -18,6 +18,10 @@ import { getSpecById } from '../catalog/specs.js';
 import { createTopoOverlay } from '../debug/topoOverlay.js';
 import { createJointOverlay } from '../debug/jointOverlay.js';
 
+import { nodeWorldPos } from '../graph/coords.js';
+
+import { isOnScreenPx } from '../core/camera.js';
+
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
 }) {
@@ -30,14 +34,6 @@ export function createDrawManager({
   const edgeIdToLine = new Map(); // endast center-edges
   const nodeIdToSphere = new Map();
 
-  // Hjälpare: world-pos för graph-node oavsett lagringsmodell
-  function nodeWorldPos(n) {
-    if (!n) return { x:0,y:0,z:0 };
-    if (n.pos) return n.pos;
-    const b = n.base || {x:0,y:0,z:0};
-    const o = n.offset || {x:0,y:0,z:0};
-    return { x:(b.x??0)+(o.x??0), y:(b.y??0)+(o.y??0), z:(b.z??0)+(o.z??0) };
-  }
 
   const topoOverlay = createTopoOverlay({
     graph,
@@ -107,13 +103,6 @@ export function createDrawManager({
   // Public API
   function getStartPoint() { return state.draw.lineStartPoint; }
 
-  function isOnScreenPx(camera, canvas, point3D, marginPx = 20) {
-    const v = point3D.clone().project(camera);
-    if (v.z < -1 || v.z > 1) return false;
-    const x = (v.x + 1) * 0.5 * canvas.width;
-    const y = (-v.y + 1) * 0.5 * canvas.height;
-    return (x>=marginPx && x<=canvas.width-marginPx && y>=marginPx && y<=canvas.height-marginPx);
-  }
 
   function setCurrentSpec(id, { announce = true } = {}) {
     const spec = getSpecById(id);
