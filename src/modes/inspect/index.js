@@ -7,7 +7,7 @@ import { state } from '../../state/appState.js';
 let idleMarker, setIdleMarkerColor;
 let camera, renderer3D, overlay, picker, snapper, graph, controls;
 let nodeWorldPos, addVertexSphere, COLORS;
-
+let topoOverlay, jointOverlay;
 // Init – kalla denna en gång från drawManager
 export function init(ctx) {
   ({
@@ -21,7 +21,8 @@ export function init(ctx) {
     nodeWorldPos,
     addVertexSphere,
     idleMarker, setIdleMarkerColor, 
-    COLORS
+    COLORS, 
+    topoOverlay, jointOverlay
   } = ctx);
 }
 
@@ -92,4 +93,22 @@ export function handleHover(e, pickPlaneMesh) {
   }
   const hit = picker.raycaster.intersectObject(pickPlaneMesh);
   if (hit.length) idleMarker.position.copy(hit[0].point);
+}
+
+//key bindings
+export function handleKeyDown(e) {
+  // Debug toggles endast i inspektionsläge
+  if (e.code === 'KeyD') {
+    e.preventDefault();
+    topoOverlay.toggle();
+    if (topoOverlay.isActive()) topoOverlay.update();
+    return true;
+  }
+  if (e.code === 'KeyJ') {
+    e.preventDefault();
+    jointOverlay.toggle();
+    if (jointOverlay.isActive()) jointOverlay.updateAll();
+    return true;
+  }
+  return false;
 }

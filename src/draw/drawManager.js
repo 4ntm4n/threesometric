@@ -75,7 +75,7 @@ export function createDrawManager({
   inspect.init({
   camera, renderer3D, overlay, picker, snapper, graph, controls,
   nodeWorldPos, addVertexSphere, COLORS,
-  idleMarker, setIdleMarkerColor     // ← lägg till dessa två
+  idleMarker, setIdleMarkerColor, topoOverlay, jointOverlay          // ← lägg till dessa två
 });
 
   const {
@@ -177,17 +177,8 @@ export function createDrawManager({
     }
 
     // Debug toggles i inspektionsläge
-    if (!document.pointerLockElement && e.code === 'KeyD') {
-      e.preventDefault();
-      topoOverlay.toggle();
-      if (topoOverlay.isActive()) topoOverlay.update();
-      return;
-    }
-    if (!document.pointerLockElement && e.code === 'KeyJ') {
-      e.preventDefault();
-      jointOverlay.toggle();
-      if (jointOverlay.isActive()) jointOverlay.updateAll();
-      return;
+    if (!document.pointerLockElement) {
+      if (inspect.handleKeyDown?.(e)) return;
     }
 
     // Ritläge: låt lineTool hantera spec-tangenterna
