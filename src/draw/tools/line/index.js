@@ -1,18 +1,18 @@
-//src/draw/tools/line/index.js
-import { angleToIsoDir3D, pixelsPerWorldUnit, snapAngleDeg } from '../../../core/utils.js'
-import { ISO_ANGLES } from '../../../core/constants.js'
-import { state } from '../../../state/appState.js'
+// src/draw/tools/line/index.js
 import { THREE } from '../../../platform/three.js';
-import { getSpecById } from '../../../catalog/specs.js';
+import { angleToIsoDir3D, pixelsPerWorldUnit, snapAngleDeg } from '../../../core/utils.js';
+import { ISO_ANGLES } from '../../../core/constants.js';
+import { state } from '../../../state/appState.js';
+import { getSpecById, cycleSpec, PIPE_SPECS } from '../../../catalog/specs.js';
 import { evaluateNodeStress } from '../../../ops/stress.js';
-import { cycleSpec, PIPE_SPECS } from '../../../catalog/specs.js'
-
 
 let camera, overlay, snapper,
     graph, modelGroup, picker,
     topoOverlay, jointOverlay,
     nodeWorldPos, edgeIdToLine, nodeIdToSphere,
-    COLORS, addVertexSphere, setCurrentSpec;
+    COLORS, addVertexSphere, setCurrentSpec,
+    toGraphSpace, isAlignmentActive, toViewDir;
+    
 
 export function init(ctx){
   camera = ctx.camera;
@@ -32,40 +32,51 @@ export function init(ctx){
 
   COLORS = ctx.COLORS;
   addVertexSphere = ctx.addVertexSphere;
+
+  // alignment callbacks (med säkra fallbacks)
+  toGraphSpace = ctx.toGraphSpace || ((v) => v);
+  isAlignmentActive = ctx.isAlignmentActive || (() => false);
+  toViewDir = ctx.toViewDir || ((d) => d);   
 }
 
-//preview line
+// ──────────────────────────────────────────────────────────────────────────────
+// Preview (iso-snap eller nod-snap)
+// ──────────────────────────────────────────────────────────────────────────────
 function predictEndPointAxis() {
-    const dx = overlay.virtualCursorPix.x - overlay.start2D.x;
-    const dy = overlay.start2D.y - overlay.virtualCursorPix.y;
-    const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
-    const snapped = snapAngleDeg(rawAngle, ISO_ANGLES);
-    const dir3D = angleToIsoDir3D(snapped);
-    const ppu = pixelsPerWorldUnit(camera, overlay.canvas, dir3D, state.draw.lineStartPoint);
-    const pixelsLen = Math.hypot(dx, dy);
-    const worldLen = pixelsLen / ppu;
-    const end3D = state.draw.lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
-    return { end3D, worldLen, snappedToNode: false };
+  const dx = overlay.virtualCursorPix.x - overlay.start2D.x;
+  const dy = overlay.start2D.y - overlay.virtualCursorPix.y;
+  const rawAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
+
+  const snapped = snapAngleDeg(rawAngle, ISO_ANGLES);
+  const dir3D = angleToIsoDir3D(snapped); // ← OBS: INTE roterad här
+
+  const ppu = pixelsPerWorldUnit(camera, overlay.canvas, dir3D, state.draw.lineStartPoint);
+  const pixelsLen = Math.hypot(dx, dy);
+  const worldLen = pixelsLen / ppu;
+  const end3D = state.draw.lineStartPoint.clone().add(dir3D.multiplyScalar(worldLen));
+  return { end3D, worldLen, snappedToNode: false };
 }
 
 function predictEndPointNormal() {
-    const snapPos = snapper.findNearestNode2D(overlay.virtualCursorPix.x, overlay.virtualCursorPix.y);
-    if (snapPos && snapPos.distanceToSquared(state.draw.lineStartPoint) > 1e-10) {
-      const end3D = snapPos.clone();
-      const worldLen = Math.sqrt(state.draw.lineStartPoint.distanceToSquared(end3D));
-      return { end3D, worldLen, snappedToNode: true };
-    }
-    return predictEndPointAxis();
+  const snapPos = snapper.findNearestNode2D(overlay.virtualCursorPix.x, overlay.virtualCursorPix.y);
+  if (snapPos && snapPos.distanceToSquared(state.draw.lineStartPoint) > 1e-10) {
+    const end3D = snapPos.clone();
+    const worldLen = Math.sqrt(state.draw.lineStartPoint.distanceToSquared(end3D));
+    return { end3D, worldLen, snappedToNode: true };
+  }
+  return predictEndPointAxis();
 }
 
 export function predictEndPoint() {
-    return state.draw.isConstruction ? predictEndPointAxis() : predictEndPointNormal();
+  return state.draw.isConstruction ? predictEndPointAxis() : predictEndPointNormal();
 }
 
-//pointer events
-function addModelLine(a, b, { dashed = false, edgeId = null } = {}) {
-const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
-const mat = dashed
+// ──────────────────────────────────────────────────────────────────────────────
+// Minimal line-helper: rendera linje, inga side effects (commitIfAny sköter övrigt)
+// ──────────────────────────────────────────────────────────────────────────────
+function addModelLine(a, b, { dashed = false } = {}) {
+  const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
+  const mat = dashed
     ? new THREE.LineDashedMaterial({
         color: 0x9aa6b2,
         dashSize: 0.35,
@@ -74,29 +85,33 @@ const mat = dashed
         opacity: 0.95,
         depthTest: false,
         depthWrite: false,
-    })
+      })
     : new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false });
 
-const line = new THREE.Line(geom, mat);
-if (dashed && line.computeLineDistances) line.computeLineDistances();
-line.renderOrder = 1;
-modelGroup.add(line);
-
-if (!dashed && edgeId) edgeIdToLine.set(edgeId, line);
-
-const pickCyl = picker.makePickCylinder(a, b);
-if (pickCyl) picker.pickables.add(pickCyl);
-return line;
+  const line = new THREE.Line(geom, mat);
+  if (dashed && line.computeLineDistances) line.computeLineDistances();
+  line.renderOrder = 1;
+  modelGroup.add(line);
+  return line;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Commit
+// ──────────────────────────────────────────────────────────────────────────────
 export function commitIfAny() {
   const { end3D, worldLen } = predictEndPoint();
   if (worldLen <= 1e-6) return;
 
+  // View → Graph space om modellen är invriden
+  const aView = state.draw.lineStartPoint.clone();
+  const bView = end3D.clone();
+  const aG = toGraphSpace(aView);
+  const bG = toGraphSpace(bView);
+
   // 1) Uppdatera graf
   const kind = state.draw.isConstruction ? 'construction' : 'center';
-  const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
-  const { node: bNode } = graph.getOrCreateNodeAt(end3D);
+  const { node: aNode } = graph.getOrCreateNodeAt(aG);
+  const { node: bNode } = graph.getOrCreateNodeAt(bG);
   const edge = graph.addEdge(aNode.id, bNode.id, kind);
 
   // 1.1) Spec för center-edges
@@ -109,38 +124,39 @@ export function commitIfAny() {
   if (edge && kind === 'center' && typeof graph.classifyAndStoreMany === 'function') {
     const near = new Set([aNode.id, bNode.id]);
     for (const nid of [...near]) {
-      for (const { otherId } of graph.neighbors(nid, { kind:'center' })) near.add(otherId);
+      for (const { otherId } of graph.neighbors(nid, { kind: 'center' })) near.add(otherId);
     }
     const nearArr = [...near];
 
     graph.classifyAndStoreMany(nearArr);
-
-    //  Stress-koll på berörda noder + grannar
     evaluateNodeStress(graph, nearArr);
 
-    //  Uppdatera overlays
     if (topoOverlay?.isActive?.()) topoOverlay.update();
     if (jointOverlay?.isActive?.()) jointOverlay.updateNodes(nearArr);
   }
 
-  // 2) 3D-linje
+  // 2) Render-line + pickable i GRAF-rummet (frameRoot roterar visuellt)
   const dashed = state.draw.isConstruction;
-  addModelLine(
-    new THREE.Vector3(state.draw.lineStartPoint.x, state.draw.lineStartPoint.y, state.draw.lineStartPoint.z),
-    new THREE.Vector3(end3D.x, end3D.y, end3D.z),
-    { dashed, edgeId: edge && edge.kind === 'center' ? edge.id : null }
-  );
+  const aV3 = new THREE.Vector3(aG.x, aG.y, aG.z);
+  const bV3 = new THREE.Vector3(bG.x, bG.y, bG.z);
+  const line = addModelLine(aV3, bV3, { dashed });
+  if (!dashed && edge) edgeIdToLine.set(edge.id, line);
+
+  const pickCyl = picker.makePickCylinder(aV3, bV3);
+  if (pickCyl) picker.pickables.add(pickCyl);
 
   // 3) nod-spheres
-  addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
-  addVertexSphere(end3D, bNode.id, COLORS.vertex);
+  addVertexSphere(aG, aNode.id, COLORS.vertex);
+  addVertexSphere(bG, bNode.id, COLORS.vertex);
 
-  // 4) fortsätt rita från slutpunkten
-  state.draw.lineStartPoint.copy(end3D);
+  // 4) fortsätt rita från VISNINGS-punkten (inte aG/bG)
+  state.draw.lineStartPoint.copy(bView);
   overlay.recenterCursorToStart();
 }
 
-//toggla mellan olika rörspecifikationer (just nu mockdata)
+// ──────────────────────────────────────────────────────────────────────────────
+// Tangentbindningar (ritläge)
+// ──────────────────────────────────────────────────────────────────────────────
 export function handleKeyDown(e){
   // , .  (cycle spec)
   if (e.code === 'Period' || e.code === 'Comma') {
