@@ -22,6 +22,11 @@ import { nodeWorldPos } from '../graph/coords.js';
 
 import { isOnScreenPx } from '../core/camera.js';
 
+//modelrotation
+import * as alignment from '../view/alignment.js';
+
+
+
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
 }) {
@@ -54,25 +59,68 @@ export function createDrawManager({
 
   function setIdleMarkerColor(hex) { idleMarker.material.color.setHex(hex); }
 
+  // Frame-root vi kan rotera som en enhet
+  const frameRoot = new THREE.Group();
+scene.add(frameRoot);
+function safeReparent(obj){ if (!obj) return; if (obj.parent) obj.parent.remove(obj); frameRoot.add(obj); }
+safeReparent(modelGroup);
+safeReparent(permanentVertices);
+safeReparent(picker.pickables);
+safeReparent(idleMarker);
+
+// knyt frameRoot under alignGroup
+alignment.attach(scene, frameRoot);
+
+// 3D-grid som roterar med modellen (XZ-grid t.ex.)
+const helperGrid = new THREE.GridHelper(200, 40, 0x2a9d8f, 0x264653);
+helperGrid.material.opacity = 0.25;
+helperGrid.material.transparent = true;
+helperGrid.visible = false;
+frameRoot.add(helperGrid);
+
+// små hjälpare
+function enableAlignedGrid(on){
+  helperGrid.visible = !!on;
+  // vill du samtidigt dölja 2D-overlay-grid:
+  // overlay.setGridVisible && overlay.setGridVisible(!on);
+}
+
+
   // ── Initiera verktyg/moder
   slopeTool.init({
     scene, graph, picker, snapper, nodeWorldPos,
     edgeIdToLine, nodeIdToSphere, topoOverlay, jointOverlay,
     setIdleMarkerColor, COLORS, idleMarker
   });
+  
   lineTool.init({
     camera, overlay, snapper,
     graph, modelGroup, picker,
     topoOverlay, jointOverlay,
     nodeWorldPos, edgeIdToLine, nodeIdToSphere,
     COLORS, addVertexSphere,
-    setCurrentSpec
+    setCurrentSpec,
+    toGraphSpace: alignment.toGraphSpace,
+    isAlignmentActive: alignment.isActive,
+    // (behöver inte toViewDir när vi fixar riktningen nedan)
   });
+
   inspect.init({
-  camera, renderer3D, overlay, picker, snapper, graph, controls,
-  nodeWorldPos, addVertexSphere, COLORS,
-  idleMarker, setIdleMarkerColor, topoOverlay, jointOverlay          // ← lägg till dessa två
-});
+    camera, renderer3D, overlay, picker, snapper, graph, controls,
+    nodeWorldPos, addVertexSphere, COLORS,
+    idleMarker, setIdleMarkerColor,
+    topoOverlay, jointOverlay,
+
+    // vrid in med animation + slå på roterande grid
+    alignToSegment: (a, b, piv, refDir) => {
+      enableAlignedGrid(true);
+      alignment.alignToSegment(a, b, piv, { animate: true, durationMs: 500, refDir });
+    },
+    resetAlignment: () => {
+      alignment.reset();
+      enableAlignedGrid(false);
+    }
+  });
 
   const {
     slope,
@@ -114,6 +162,7 @@ export function createDrawManager({
 
   // Pointer events
  function onMouseMove(e, pickPlaneMesh) {
+  if (alignment.isAnimating?.()) return;
   if (document.pointerLockElement) {
     if (state.draw.isDrawing && state.draw.hasStart) {
       overlay.setVirtualCursorTo2D({
@@ -131,6 +180,8 @@ export function createDrawManager({
   return inspect.handleHover(e, pickPlaneMesh); // grön hover i inspektionsläge
 }
   function onPointerDown(e, pickPlaneMesh) {
+    if (alignment.isAnimating?.()) return;
+
     if (e.button !== 0) return;
 
     // Slope-läge (ingen pointer-lock)
@@ -178,6 +229,7 @@ export function createDrawManager({
 
   function onKeyUp(e, { resetIsoAndFitAll: reset }) {
     if (e.code === 'Escape') {
+      alignment.reset();
       // Avbryt slope-läge om aktivt
       if (slope.active) {
         clearSlopePreview();
@@ -210,7 +262,10 @@ export function createDrawManager({
   }
 
   function onPointerLockChange() {
-    if (!document.pointerLockElement) {
+    const unlocked = !document.pointerLockElement;
+
+    if (unlocked) {
+      alignment.reset(); // nolla in-vridning när vi lämnar ritläget
       if (state.draw.isDrawing || state.draw.pending || state.draw.hasStart) {
         state.draw.isDrawing = false;
         state.draw.hasStart = false;
@@ -220,6 +275,7 @@ export function createDrawManager({
       }
       return;
     }
+
     if (state.draw.hasStart) {
       if (state.ui.virtualCursor) state.ui.virtualCursor.style.display = 'block';
       overlay.recenterCursorToStart();
