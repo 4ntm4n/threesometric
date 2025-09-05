@@ -136,10 +136,10 @@ export function handlePointerDown(e, pickPlaneMesh) {
     return enterDrawMode({ controls, startPoint: state.draw.lineStartPoint });
   }
 
-  // 3) Planträff – fri punkt
+  // 3) Planträff – alltid origo
   const hit = picker.raycaster.intersectObject(pickPlaneMesh);
   if (hit.length) {
-    state.draw.lineStartPoint.copy(hit[0].point);
+    state.draw.lineStartPoint.set(0, 0, 0); // ← alltid (0,0,0)
     const { node: aNode } = graph.getOrCreateNodeAt(state.draw.lineStartPoint);
     addVertexSphere(state.draw.lineStartPoint, aNode.id, COLORS.vertex);
     resetAlignmentCb?.(); // fri punkt: ingen in-vridning

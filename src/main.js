@@ -27,6 +27,7 @@ const { ISO_OFFSET, ISO_THETA, ISO_PHI } = computeIsoAnglesFromCamera(camera);
 state.iso = { ISO_OFFSET, ISO_THETA, ISO_PHI };
 
 const overlay = createOverlay2D();
+overlay.attachGraph?.(graph);
 const picker  = createPicker(scene);
 const snapper = createSnapper(camera, overlay.canvas, permanentVertices);
 

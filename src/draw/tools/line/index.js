@@ -78,7 +78,7 @@ function addModelLine(a, b, { dashed = false } = {}) {
   const geom = new THREE.BufferGeometry().setFromPoints([a, b]);
   const mat = dashed
     ? new THREE.LineDashedMaterial({
-        color: 0x9aa6b2,
+        color: 0xef92d8,
         dashSize: 0.35,
         gapSize: 0.22,
         transparent: true,

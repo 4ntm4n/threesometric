@@ -295,6 +295,33 @@ export function createGraph() {
     return [...set];
   }
 
+  // ──────────────────────────────────────────────────────────────────────────
+  // Dimensions metadata on edges (schematic mode)
+  // ──────────────────────────────────────────────────────────────────────────
+  function setEdgeDimension(edgeId, dim) {
+    const e = edges.get(edgeId);
+    if (!e) return false;
+    // { valueMm:number, mode:'aligned'|'axisX'|'axisZ'|'axisY', label?:string, source?:'schematic'|'scaled' }
+    e.dim = {
+      valueMm: typeof dim?.valueMm === 'number' ? dim.valueMm : null,
+      mode: dim?.mode || 'aligned',
+      label: dim?.label ?? null,
+      source: dim?.source || 'schematic',
+    };
+    return true;
+  }
+  function getEdgeDimension(edgeId) {
+    const e = edges.get(edgeId);
+    return e?.dim || null;
+  }
+  function clearEdgeDimension(edgeId) {
+    const e = edges.get(edgeId);
+    if (!e || !e.dim) return false;
+    delete e.dim;
+    return true;
+  }
+
+
   return {
     // data
     nodes, edges, adj,
@@ -311,5 +338,7 @@ export function createGraph() {
     collectAffectedEdges,
     // thresholds (om UI/ops vill läsa)
     consts: { EPS, HORIZ_EPS, DOT_COLINEAR_MIN, DOT_ORTHO_MAX, TIE_MARGIN },
+
+    setEdgeDimension, getEdgeDimension, clearEdgeDimension,
   };
 }

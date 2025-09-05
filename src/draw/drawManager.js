@@ -13,6 +13,7 @@ import { COLORS } from '../core/constants.js';
 import * as slopeTool from './tools/slope/index.js';
 import * as lineTool from './tools/line/index.js';
 import * as inspect from '../modes/inspect/index.js';
+import * as dimTool from '../measure/dimensionTool.js';
 
 import { getSpecById } from '../catalog/specs.js';
 import { createTopoOverlay } from '../debug/topoOverlay.js';
@@ -122,6 +123,9 @@ function enableAlignedGrid(on){
     }
   });
 
+  dimTool.init({ camera, overlay, graph, edgeIdToLine });
+
+
   const {
     slope,
     clearSlopePreview,
@@ -161,24 +165,28 @@ function enableAlignedGrid(on){
   }
 
   // Pointer events
- function onMouseMove(e, pickPlaneMesh) {
-  if (alignment.isAnimating?.()) return;
-  if (document.pointerLockElement) {
-    if (state.draw.isDrawing && state.draw.hasStart) {
-      overlay.setVirtualCursorTo2D({
-        x: overlay.virtualCursorPix.x + e.movementX,
-        y: overlay.virtualCursorPix.y + e.movementY
-      });
+  function onMouseMove(e, pickPlaneMesh) {
+    if (alignment.isAnimating?.()) return;
+    if (document.pointerLockElement) {
+      if (state.draw.isDrawing && state.draw.hasStart) {
+        overlay.setVirtualCursorTo2D({
+          x: overlay.virtualCursorPix.x + e.movementX,
+          y: overlay.virtualCursorPix.y + e.movementY
+        });
+      }
+      return; // inget hover i draw-läge
     }
-    return; // inget hover i draw-läge
+
+    
+    if (slope.active) {
+      return slopeTool.handleHover(e); // orange hover i slope-läge
+      }
+      if (dimTool.isActive()) {
+        return dimTool.handleHover(e);
+      }
+      return inspect.handleHover(e, pickPlaneMesh); // grön hover i inspektionsläge
   }
 
-  if (slope.active) {
-    return slopeTool.handleHover(e); // orange hover i slope-läge
-  }
-
-  return inspect.handleHover(e, pickPlaneMesh); // grön hover i inspektionsläge
-}
   function onPointerDown(e, pickPlaneMesh) {
     if (alignment.isAnimating?.()) return;
 
@@ -189,6 +197,10 @@ function enableAlignedGrid(on){
       return slopeTool.onPointerDown(e);
     }
     
+    if (!document.pointerLockElement && dimTool.isActive()) {
+      return dimTool.onPointerDown(e);
+    }
+
     // Vanlig inspektionsklick → starta ritning
     if (!document.pointerLockElement) {
       return inspect.handlePointerDown(e, pickPlaneMesh);
@@ -224,6 +236,16 @@ function enableAlignedGrid(on){
     // Ritläge: låt lineTool hantera spec-tangenterna
     if (document.pointerLockElement) {
       if (lineTool.handleKeyDown?.(e)) return;
+    }
+
+    // Dimensions mode (inspektionsläge)
+    if (!document.pointerLockElement) {
+      if (e.code === 'KeyM') {
+        e.preventDefault();
+        dimTool.toggle();
+        return;
+      }
+      if (dimTool.isActive() && dimTool.onKeyDown(e)) return;
     }
   }
 
@@ -284,6 +306,8 @@ function enableAlignedGrid(on){
         state.draw.pending = false;
       }
     }
+
+    
   }
 
   function onResize(camera, renderer3D) {
