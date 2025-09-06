@@ -92,9 +92,12 @@ export function createOverlay2D() {
 
     // Ritstil
     ctx.save();
-    ctx.setLineDash([]);
-    ctx.lineWidth = 1;
-    ctx.strokeStyle = '#ffffff';
+    const isDerived = dim?.source === 'derived';
+    const hasConflict = !!dim?.conflict;
+    ctx.setLineDash(hasConflict ? [2,3] : []);
+    ctx.lineWidth = hasConflict ? 2 : 1;
+    ctx.strokeStyle = hasConflict ? '#ff6b6b' : (isDerived ? '#9ecbff' : '#ffffff');
+
 
     // Förlängningslinjer
     ctx.beginPath();
@@ -119,11 +122,10 @@ export function createOverlay2D() {
     ctx.stroke();
 
     // Text
-    const txt = (label && label.length) ? label : `${Math.round(valueMm)} mm`;
-    const midDim = { x: (qA.x + qB.x)/2, y: (qA.y + qB.y)/2 };
+    const txt = `${Number(valueMm).toFixed(2)} mm`;    const midDim = { x: (qA.x + qB.x)/2, y: (qA.y + qB.y)/2 };
     const textOff = 10;
     ctx.font = '12px ui-sans-serif, system-ui, -apple-system';
-    ctx.fillStyle = '#ffffff';
+    ctx.fillStyle = hasConflict ? '#ff6b6b' : (isDerived ? '#9ecbff' : '#ffffff');
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(txt, midDim.x + n.x*textOff, midDim.y + n.y*textOff);

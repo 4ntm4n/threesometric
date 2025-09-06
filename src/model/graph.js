@@ -8,12 +8,24 @@ export function createGraph() {
   const edges = new Map(); // id -> { id, a, b, kind:'center'|'construction', spec?:{od, wt, material} }
   const adj   = new Map(); // nodeId -> Set(edgeId)
 
+  // Dimension change listeners
+  const _dimListeners = [];
+  function onEdgeDimensionChanged(cb){ if (typeof cb === 'function') _dimListeners.push(cb); }
+  function _emitDimChanged(edgeId){
+    for (const cb of _dimListeners) {
+      try { cb(edgeId); } catch(e){ /* ignore listener errors */ }
+    }
+  }
+
+
   let nodeSeq = 1;
   let edgeSeq = 1;
 
   function _newNodeId() { return `n${nodeSeq++}`; }
   function _newEdgeId() { return `e${edgeSeq++}`; }
   function _ensureAdj(nid) { if (!adj.has(nid)) adj.set(nid, new Set()); }
+
+
 
   // numerik (låg, inte “toleranser”)
   const EPS = 1e-9;
@@ -298,18 +310,34 @@ export function createGraph() {
   // ──────────────────────────────────────────────────────────────────────────
   // Dimensions metadata on edges (schematic mode)
   // ──────────────────────────────────────────────────────────────────────────
-  function setEdgeDimension(edgeId, dim) {
+  function setEdgeDimension(edgeId, dim, options = {}) {
     const e = edges.get(edgeId);
     if (!e) return false;
-    // { valueMm:number, mode:'aligned'|'axisX'|'axisZ'|'axisY', label?:string, source?:'schematic'|'scaled' }
+
+    // expected: { valueMm:number, mode:'aligned'|'axisX'|'axisZ'|'axisY',
+    //             label?:string, source?:'user'|'derived', userEditedAt?:number, derivedFrom?:any }
+    const source  = dim?.source || 'user';
+    const valueMm = (typeof dim?.valueMm === 'number' && isFinite(dim.valueMm)) ? dim.valueMm : null;
+    const now     = (typeof dim?.userEditedAt === 'number') ? dim.userEditedAt
+                    : (source === 'user' ? Date.now() : undefined);
+
     e.dim = {
-      valueMm: typeof dim?.valueMm === 'number' ? dim.valueMm : null,
-      mode: dim?.mode || 'aligned',
-      label: dim?.label ?? null,
-      source: dim?.source || 'schematic',
+      valueMm,
+      mode:  dim?.mode  || e.dim?.mode  || 'aligned',
+      label: dim?.label ?? e.dim?.label ?? null,
+      source,
+      userEditedAt: source === 'user' ? now : (e.dim?.userEditedAt ?? null),
+      derivedFrom:  dim?.derivedFrom ?? null,
+      derivedAt:    source === 'derived' ? Date.now() : (e.dim?.derivedAt ?? null),
+      conflict:     dim?.conflict ?? null,
     };
+
+    if (!options?.silent) _emitDimChanged(edgeId);
     return true;
   }
+
+
+
   function getEdgeDimension(edgeId) {
     const e = edges.get(edgeId);
     return e?.dim || null;
@@ -320,6 +348,8 @@ export function createGraph() {
     delete e.dim;
     return true;
   }
+
+  
 
 
   return {
@@ -339,6 +369,6 @@ export function createGraph() {
     // thresholds (om UI/ops vill läsa)
     consts: { EPS, HORIZ_EPS, DOT_COLINEAR_MIN, DOT_ORTHO_MAX, TIE_MARGIN },
 
-    setEdgeDimension, getEdgeDimension, clearEdgeDimension,
+    setEdgeDimension, getEdgeDimension, clearEdgeDimension, onEdgeDimensionChanged,
   };
 }

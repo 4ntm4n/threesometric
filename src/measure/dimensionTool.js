@@ -108,7 +108,7 @@ export function onPointerDown(e){
   const valueMm = parseFloat(valStr);
   if (!isFinite(valueMm) || valueMm <= 0) return true;
 
-  graph.setEdgeDimension(eid, { valueMm, mode, source:'schematic' });
+  graph.setEdgeDimension(eid, { valueMm, mode, source:'user', userEditedAt: Date.now() });
   return true;
 }
 
