@@ -1,6 +1,8 @@
 // ──────────────────────────────────────────────────────────────────────────────
 // src/measure/metricSolver.js
 // Två-fas propagation + normalisering av lås + autosolve (as-drawn, stateless)
+// Diagonaler driver ALDRIG node-placering; de används endast för validering/derive.
+// Vid varje ändring räknar vi om hela komponenten från scratch.
 // ──────────────────────────────────────────────────────────────────────────────
 
 import { dumpComponentAroundEdge, dumpPathAndRecency } from '../debug/metricTrace.js';
@@ -13,6 +15,9 @@ const TOL = 0.1; // mm
 let gRef = null;
 let inBatch = false;
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Publikt API
+// ──────────────────────────────────────────────────────────────────────────────
 export function init({ graph }) {
   gRef = graph;
 
@@ -20,10 +25,10 @@ export function init({ graph }) {
     if (inBatch) return;
     const g = gRef; const changed = g?.getEdge(eid); if (!changed) return;
 
-    // 1) Alltid: recompute (Fas 1 + Fas 2)
-    recomputeComponent(eid);
+    // 1) Alltid: recompute (Fas 1 + Fas 2) från scratch för hela komponenten
+    recomputeComponentFromScratch(eid);
 
-    // 2) Hitta alla user-diagonaler (center) i samma komponent
+    // 2) Samla användarsatta diagonaler (center) i samma komponent
     const diagsBefore = listUserCenterEdgesInComponent(g, eid);
     if (!diagsBefore.length) return;
 
@@ -33,7 +38,7 @@ export function init({ graph }) {
     // 4) Recompute och autosolve för kvarvarande user-diagonaler
     const diagsAfter = listUserCenterEdgesInComponent(g, eid);
     for (const d of diagsAfter) {
-      recomputeComponent(d.id);
+      recomputeComponentFromScratch(d.id);
       autosolveDiagonal_LockTwoLatest_AdjustOldest(d.id);
     }
   });
@@ -42,38 +47,42 @@ export function init({ graph }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Recompute: Fas 1 (construction-only) + Fas 2 (derive/validate)
+// Recompute FROM SCRATCH: Fas 1 (construction + ryggrad-center) + Fas 2 (derive/validate)
 // ──────────────────────────────────────────────────────────────────────────────
-function recomputeComponent(edgeId) {
+function recomputeComponentFromScratch(edgeId) {
   const g = gRef; if (!g) return;
   const e0 = g.getEdge(edgeId); if (!e0) return;
 
   const { nodes: compNodes, edges: compEdges } = collectComponentFromEdge(g, edgeId);
   if (!compNodes.length) return;
 
-  // Nolla metric
+  // Nolla all metric för komponenten
   for (const nid of compNodes) {
     const n = g.getNode(nid);
     n.meta = n.meta || {};
     n.meta.metric = { x:0, y:0, z:0, known:false };
   }
 
-  const hasConstruction = compEdges.some(eid => g.getEdge(eid)?.kind === 'construction');
-
-  // Seed: origo om möjligt
+  // Seed: origo om möjligt (annars första noden i komponenten)
   const originId = findWorldOriginNode(g, compNodes) ?? compNodes[0];
   g.getNode(originId).meta.metric = { x:0, y:0, z:0, known:true };
 
-  // Fas 1: endast via construction om sådana finns; annars fallback center
-  let changed = true, guard = 0;
-  while (changed && guard < 3 * compEdges.length + 10) {
-    changed = false; guard++;
-    for (const eid of compEdges) {
-      const ed = g.getEdge(eid); if (!ed) continue;
-      if (hasConstruction && ed.kind !== 'construction') continue;
+  // Förbered en lista på alla kanter i komponenten
+  const allEdges = compEdges.map(eid => g.getEdge(eid)).filter(Boolean);
 
+  // ── Fas 1: Iterativ propagation i två delpass per varv
+  // Pass A: CONSTRUCTION (oavsett source) – strikt axelrät
+  // Pass B: CENTER men bara om source === 'user' OCH det INTE finns en construction-path
+  //         mellan noderna (dvs INTE en diagonal). "Ryggrad-center" får driva, diagonaler inte.
+  let changed = true, guard = 0;
+  while (changed && guard < 3 * allEdges.length + 10) {
+    changed = false; guard++;
+
+    // A) construction
+    for (const ed of allEdges) {
+      if (ed.kind !== 'construction') continue;
       const dim = ed.dim;
-      const val = (dim && typeof dim.valueMm === 'number' && isFinite(dim.valueMm)) ? dim.valueMm : null;
+      const val = (typeof dim?.valueMm === 'number' && isFinite(dim.valueMm)) ? dim.valueMm : null;
       if (val == null) continue;
 
       const a = g.getNode(ed.a), b = g.getNode(ed.b);
@@ -88,11 +97,33 @@ function recomputeComponent(edgeId) {
         changed = true;
       }
     }
+
+    // B) center (ENDAST user, EJ diagonaler)
+    for (const ed of allEdges) {
+      if (ed.kind !== 'center') continue;
+      if ((ed.dim?.source || null) !== 'user') continue;      // använd inte derived center
+      if (hasConstructionPathBetween(g, ed.a, ed.b)) continue; // diagonal? då får den inte driva
+
+      const dim = ed.dim;
+      const val = (typeof dim?.valueMm === 'number' && isFinite(dim.valueMm)) ? dim.valueMm : null;
+      if (val == null) continue;
+
+      const a = g.getNode(ed.a), b = g.getNode(ed.b);
+      const mA = a.meta.metric, mB = b.meta.metric;
+      const dir = edgeUnitDirWorld(g, ed); // fri riktning (normerad) för center
+
+      if (mA.known && !mB.known) {
+        b.meta.metric = { x:mA.x+dir.x*val, y:mA.y+dir.y*val, z:mA.z+dir.z*val, known:true };
+        changed = true;
+      } else if (!mA.known && mB.known) {
+        a.meta.metric = { x:mB.x-dir.x*val, y:mB.y-dir.y*val, z:mB.z-dir.z*val, known:true };
+        changed = true;
+      }
+    }
   }
 
-  // Fas 2: derive/validera från node.metric
-  for (const eid of compEdges) {
-    const ed = g.getEdge(eid); if (!ed) continue;
+  // ── Fas 2: derive/validera från node.metric
+  for (const ed of allEdges) {
     const aM = g.getNode(ed.a)?.meta?.metric;
     const bM = g.getNode(ed.b)?.meta?.metric;
     if (!aM?.known || !bM?.known) continue;
@@ -105,13 +136,13 @@ function recomputeComponent(edgeId) {
       const delta = Math.abs((dim.valueMm ?? 0) - d);
       const hadConflict = !!dim?.conflict;
       if (delta > TOL && !hadConflict) {
-        inBatch = true; g.setEdgeDimension(eid, { ...dim, conflict: { deltaMm: delta } }, { silent: true }); inBatch = false;
+        inBatch = true; g.setEdgeDimension(ed.id, { ...dim, conflict: { deltaMm: delta } }, { silent: true }); inBatch = false;
       } else if (delta <= TOL && hadConflict) {
-        inBatch = true; g.setEdgeDimension(eid, { ...dim, conflict: null }, { silent: true }); inBatch = false;
+        inBatch = true; g.setEdgeDimension(ed.id, { ...dim, conflict: null }, { silent: true }); inBatch = false;
       }
     } else {
       inBatch = true;
-      g.setEdgeDimension(eid, {
+      g.setEdgeDimension(ed.id, {
         valueMm: d,
         mode: dim?.mode || 'aligned',
         label: dim?.label ?? null,
@@ -127,8 +158,7 @@ function recomputeComponent(edgeId) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Lås-normalisering: behåll k senaste (k = #unika axlar i path), demota övriga
-// ──────────────────────────────────────────────────────────────────────────────
+/** Lås-normalisering: behåll k senaste (k = #unika axlar i path), demota övriga */
 function normalizeLocksForDiagonal(g, diagEid) {
   const eD = g.getEdge(diagEid); if (!eD || eD.kind !== 'center') return;
   const dimD = eD.dim || null;
@@ -185,13 +215,13 @@ function normalizeLocksForDiagonal(g, diagEid) {
   }
 
   if (demotedAny) {
-    // Fyll direkt in nya derived-värden (diagonaler m.m.) baserat på nuvarande construction
-    recomputeComponent(diagEid);
+    // Recompute direkt för att fylla derived-värden efter demotion
+    recomputeComponentFromScratch(diagEid);
   }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Autosolve: lås två senaste, justera äldst (as-drawn, totalsummor per axel)
+// Autosolve: lås två senaste (diag + senaste leg), justera äldst
 // ──────────────────────────────────────────────────────────────────────────────
 function autosolveDiagonal_LockTwoLatest_AdjustOldest(diagEid) {
   const g = gRef; if (!g) return;
@@ -235,6 +265,7 @@ function autosolveDiagonal_LockTwoLatest_AdjustOldest(diagEid) {
   rec.sort((a,b)=> (b.stamp - a.stamp));
   const topTwo = new Set(rec.slice(0,2).map(x => x.eid));
 
+  // Plocka den äldsta kandidaten som inte är i topTwo
   let pick = candEdges
     .filter(c => !topTwo.has(c.eid))
     .sort((a,b)=> (a.stamp - b.stamp) || a.eid.localeCompare(b.eid))[0];
@@ -250,10 +281,10 @@ function autosolveDiagonal_LockTwoLatest_AdjustOldest(diagEid) {
   // Om pick var user → demota (behåll värde om construction)
   if (pick.dim?.source === 'user') {
     demoteOneEdge(g, pick.eid);
-    recomputeComponent(diagEid);
+    recomputeComponentFromScratch(diagEid);
   }
 
-  // Totalsummor i pathens riktning
+  // Totalsummor i pathens riktning (från första noden i pathen till sista)
   const startM = g.getNode(path.nodes[0])?.meta?.metric;
   const endM   = g.getNode(path.nodes[path.nodes.length-1])?.meta?.metric;
   if (!startM?.known || !endM?.known) return;
@@ -295,7 +326,7 @@ function autosolveDiagonal_LockTwoLatest_AdjustOldest(diagEid) {
   writeDerivedLen(g, pick.eid, newSegLen);
   if (TRACE) dumpComponentAroundEdge(g, diagEid, { title: 'AFTER autosolve write' });
 
-  recomputeComponent(diagEid);
+  recomputeComponentFromScratch(diagEid);
   if (TRACE) dumpComponentAroundEdge(g, diagEid, { title: 'AFTER final recompute' });
 }
 
@@ -432,10 +463,16 @@ function findWorldOriginNode(g, nodeIds, eps=1e-9) {
   return null;
 }
 
-// Enhetsriktning: construction → strikt axelrät
+function hasConstructionPathBetween(g, a, b) {
+  const p = findManhattanPath(g, a, b);  // BFS via endast construction
+  return !!(p && p.edges && p.edges.length);
+}
+
+// Enhetsriktning: construction → strikt axelrät; center → verklig riktning (normerad)
 function edgeUnitDirWorld(g, e) {
   const a = g.getNodeWorldPos(e.a), b = g.getNodeWorldPos(e.b);
   let dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
+
   if (e.kind === 'construction') {
     const ax = dominantAxis({x:dx,y:dy,z:dz});
     const sx = (ax==='X') ? (Math.sign(dx)||1) : 0;
