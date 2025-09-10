@@ -14,6 +14,7 @@ import * as slopeTool from './tools/slope/index.js';
 import * as lineTool from './tools/line/index.js';
 import * as inspect from '../modes/inspect/index.js';
 import * as dimTool from '../measure/dimensionTool.js';
+import * as splitTool from './tools/split/index.js';
 
 import { getSpecById } from '../catalog/specs.js';
 import { createTopoOverlay } from '../debug/topoOverlay.js';
@@ -25,6 +26,8 @@ import { isOnScreenPx } from '../core/camera.js';
 
 //modelrotation
 import * as alignment from '../view/alignment.js';
+
+
 
 
 
@@ -103,7 +106,9 @@ function enableAlignedGrid(on){
     setCurrentSpec,
     toGraphSpace: alignment.toGraphSpace,
     isAlignmentActive: alignment.isActive,
-    // (behöver inte toViewDir när vi fixar riktningen nedan)
+    
+    splitEdgeAt: (edgeId, hitWorldPos, opts = {}) =>
+    splitTool.splitEdge(graph, edgeId, { hitWorldPos, ...opts }),
   });
 
   inspect.init({

@@ -135,6 +135,29 @@ export function createGraph() {
     return null;
   }
 
+  //remove edge
+  function removeEdge(edgeId) {
+    const e = edges.get(edgeId);
+    if (!e) return false;
+    const { a, b } = e;
+    edges.delete(edgeId);
+    const bagA = adj.get(a); if (bagA) bagA.delete(edgeId);
+    const bagB = adj.get(b); if (bagB) bagB.delete(edgeId);
+    return true;
+  }
+
+  // Släpp igenom valfri meta på kanter (icke-brytande ändring)
+  function setEdgeMeta(edgeId, patch = {}) {
+    const e = edges.get(edgeId); if (!e) return false;
+    e.meta = Object.assign({}, e.meta || {}, patch || {});
+    return true;
+  }
+  function getEdgeMeta(edgeId) {
+    const e = edges.get(edgeId); if (!e) return null;
+    return e.meta || null;
+  }
+
+
   // ——— Geometrihelpers
   function horizDistXZ(a,b){ const dx=b.x-a.x, dz=b.z-a.z; return Math.hypot(dx,dz); }
 
@@ -359,7 +382,8 @@ export function createGraph() {
     addNodeAt, getOrCreateNodeAt, getNode, allNodes,
     getNodeWorldPos, setNodeWorldY, findNodeNear,
     // edge API
-    addEdge, getEdge, allEdges, neighbors, incidentEdges, edgeBetween,
+    addEdge, getEdge, allEdges, neighbors, incidentEdges, edgeBetween, 
+    removeEdge, setEdgeMeta, getEdgeMeta,
     // geom + classify
     edgeDir3D, isRiserEdge, classifyNode,
     classifyAndStore, classifyAndStoreMany, invalidateAroundEdge,
