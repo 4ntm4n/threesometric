@@ -1,22 +1,10 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// src/draw/tools/split/index.js tidigare split(splitEdge.js)
-// Delar en center-edge vid world-koord (eller param t) och skapar en "kedja"
+// src/draw/tools/split/index.js (tidigare splitEdge.js)
 // ──────────────────────────────────────────────────────────────────────────────
+import { solve } from '../../../measure/solverEngine.js';
+import { applySolution } from '../../../measure/metricBuilder.js';
 
 export function splitEdge(graph, edgeId, opts = {}) {
-  // opts:
-  //   hitWorldPos?: {x,y,z}   // alternativt
-  //   t?: number               // [0..1], om du redan projicerat
-  //   clampEps?: number        // minsta avstånd från ändar
-  //   enforceCenterOnly?: bool // default true
-  //   onEdgeRemoved?: (edgeId)=>void
-  //   onEdgeAdded?: (edgeId)=>void
-  //   onNodeCreated?: (nodeId)=>void
-  //   chainIdFactory?: (oldEdge)=>string
-  //
-  // return:
-  //   { ok, reason?, newNodeId?, leftEdgeId?, rightEdgeId?, removedEdgeId?, chainId?, t, pos }
-
   const e = graph.getEdge(edgeId);
   if (!e) return { ok:false, reason:'no_edge' };
 
@@ -34,77 +22,88 @@ export function splitEdge(graph, edgeId, opts = {}) {
   if (abLen2 <= 1e-12) return { ok:false, reason:'degenerate_edge' };
 
   function lerp(a,b,t){ return { x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, z:a.z+(b.z-a.z)*t }; }
+  function finite(n){ return (typeof n === 'number' && isFinite(n)) ? n : null; }
 
-  let t = typeof opts.t === 'number' ? opts.t : null;
+  // t från hitWorldPos (om ej given)
+  let t = (typeof opts.t === 'number') ? opts.t : null;
   if (t == null) {
     const p = opts.hitWorldPos;
     if (!p) return { ok:false, reason:'need_hitWorldPos_or_t' };
     const ap = { x: p.x - pa.x, y: p.y - pa.y, z: p.z - pa.z };
     const dot = ap.x*ab.x + ap.y*ab.y + ap.z*ab.z;
-    t = dot / abLen2; // projektion på segmentet (oklamped)
+    t = dot / abLen2;
   }
 
-  // Klampa och undvik 0/1
   const clampEps = (typeof opts.clampEps === 'number') ? opts.clampEps : 1e-6;
   const tClamped = Math.max(0, Math.min(1, t));
-  if (tClamped <= clampEps) {
-    return { ok:false, reason:'too_close_to_a', snapTo:e.a, t:0 };
-  }
-  if (tClamped >= 1 - clampEps) {
-    return { ok:false, reason:'too_close_to_b', snapTo:e.b, t:1 };
-  }
+  if (tClamped <= clampEps)  return { ok:false, reason:'too_close_to_a', snapTo:e.a, t:0 };
+  if (tClamped >= 1-clampEps) return { ok:false, reason:'too_close_to_b', snapTo:e.b, t:1 };
 
   const pSplit = lerp(pa, pb, tClamped);
 
-  // 1) Skapa ny nod i grafen (single source of truth)
+  // 1) Ny nod
   const nNew = graph.addNodeAt(pSplit);
   const newNodeId = nNew.id;
-  if (typeof opts.onNodeCreated === 'function') opts.onNodeCreated(newNodeId);
+  opts.onNodeCreated?.(newNodeId);
 
-  // Bevara ev. spec från originalkanten
-  const spec = graph.getEdgeSpec(edgeId);
-
-  // Dim-mode från original om den fanns (t.ex. 'aligned')
-  const oldDim = graph.getEdgeDimension(edgeId);
+  // Bevara spec + dim-mode
+  const spec    = graph.getEdgeSpec(edgeId);
+  const oldDim  = graph.getEdgeDimension(edgeId);
   const dimMode = oldDim?.mode || 'aligned';
 
-  // Kedje-id: använd befintligt chainId om det finns, annars original edgeId
-  const oldMeta = graph.getEdgeMeta(edgeId) || {};
-  const chainId = (typeof opts.chainIdFactory === 'function')
-    ? (opts.chainIdFactory(e) || (oldMeta.chainId || e.id))
-    : (oldMeta.chainId || e.id);
+  // Kedje-id
+  const oldMeta    = graph.getEdgeMeta(edgeId) || {};
+  const oldChainId = oldMeta?.chain?.id ?? null;
+  const chainId =
+    oldChainId ||
+    (typeof opts.chainIdFactory === 'function' ? (opts.chainIdFactory(e) || null) : null) ||
+    e.id;
 
-  // 2) Ta bort originalkanten
+  // Ev totalMm
+  const totalMm = finite(oldDim?.valueMm);
+
+  // 2) Ta bort original
   graph.removeEdge(edgeId);
-  if (typeof opts.onEdgeRemoved === 'function') opts.onEdgeRemoved(edgeId);
+  opts.onEdgeRemoved?.(edgeId);
 
-  // 3) Skapa två nya kanter
-  const left   = graph.addEdge(e.a, newNodeId, e.kind);
-  const right  = graph.addEdge(newNodeId, e.b, e.kind);
-
-  // Kopiera spec
+  // 3) Två nya kanter
+  const left  = graph.addEdge(e.a, newNodeId, e.kind);
+  const right = graph.addEdge(newNodeId, e.b, e.kind);
   if (spec) {
     graph.setEdgeSpec(left.id,  spec);
     graph.setEdgeSpec(right.id, spec);
   }
 
-  // Kedje-meta (platt kedja)
-  graph.setEdgeMeta(left.id,  { chainId, splitParentId: e.id });
-  graph.setEdgeMeta(right.id, { chainId, splitParentId: e.id });
+  // 4) Kedjemeta – **stämpla ändnoderna från originalet**
+  const chainMeta = (id)=>({
+    chain: {
+      id,
+      totalMm: totalMm ?? null,
+      distribution: 'even',
+      createdAt: Date.now(),
+      endA: e.a,          // <── DETTA ÄR NYTT
+      endB: e.b           // <── DETTA ÄR NYTT
+    },
+    splitParentId: e.id
+  });
+  graph.setEdgeMeta(left.id,  chainMeta(chainId));
+  graph.setEdgeMeta(right.id, chainMeta(chainId));
 
-  // Dim: nollställ per-segment som "derived/chain" (autosolver tar totalen sen)
-  graph.setEdgeDimension(left.id,  { valueMm: null, mode: dimMode, source:'derived', derivedFrom:{ type:'split', parentEdgeId: e.id, chainId } }, { silent:true });
-  graph.setEdgeDimension(right.id, { valueMm: null, mode: dimMode, source:'derived', derivedFrom:{ type:'split', parentEdgeId: e.id, chainId } }, { silent:true });
+  // 5) Nollställ segment-dim → solver fördelar
+  const derivedFrom = { type:'split', parentEdgeId: e.id, chainId };
+  graph.setEdgeDimension(left.id,  { valueMm: null, mode: dimMode, source:'derived', derivedFrom }, { silent:true });
+  graph.setEdgeDimension(right.id, { valueMm: null, mode: dimMode, source:'derived', derivedFrom }, { silent:true });
 
-  if (typeof opts.onEdgeAdded === 'function') {
-    opts.onEdgeAdded(left.id);
-    opts.onEdgeAdded(right.id);
-  }
+  opts.onEdgeAdded?.(left.id);
+  opts.onEdgeAdded?.(right.id);
 
-  // Klassificera lokalt (för overlay/debug)
+  // 6) Klassificera topo
   graph.classifyAndStoreMany([ e.a, newNodeId, e.b ]);
 
-  // Ge tillbaka en enkel payload till UI/solver/picking
+  // 7) Räkna + applicera direkt
+  const solution = solve(graph, left.id);
+  applySolution(graph, solution, { silent: false });
+
   return {
     ok: true,
     newNodeId,

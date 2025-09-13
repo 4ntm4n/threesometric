@@ -1,86 +1,433 @@
 diff --git a/src/measure/metricSolver.js b/src/measure/metricSolver.js
 --- a/src/measure/metricSolver.js
 +++ b/src/measure/metricSolver.js
-@@ -1,19 +1,20 @@
- // ──────────────────────────────────────────────────────────────────────────────
- // src/measure/metricSolver.js
- // Tunn orkestratör som delegerar till solverEngine (Phase-1 refaktor).
- // ──────────────────────────────────────────────────────────────────────────────
- 
+
  import { dumpComponentAroundEdge, dumpPathAndRecency } from '../debug/metricTrace.js';
- import {
-   recomputeComponentFromScratch as recompute$,
-   normalizeLocksForDiagonal     as normalize$,
-   autosolveDiagonal_LockTwoLatest_AdjustOldest as autosolve$,
-   listUserCenterEdgesInComponent as listUserCenters$
- } from './solverEngine.js';
-+import { applySolution } from './metricBuilder.js';
- 
- const TRACE = true;
- const DEBUG = false;
- const log  = (...a)=>{ if (DEBUG) console.log('[metric]', ...a); };
- 
- let gRef = null;
- let inBatch = false;
-@@ -35,6 +36,10 @@ export function init({ graph }) {
-     const dbg = { dumpComponentAroundEdge, dumpPathAndRecency };
- 
-     // 1) Recompute hela komponenten
-     recompute$(g, eid, setDim, dbg);
-@@ -46,11 +51,57 @@ export function init({ graph }) {
-     const diagsAfter = listUserCenters$(g, eid);
-     for (const d of diagsAfter) {
-       recompute$(g, d.id, setDim, dbg);
-       autosolve$(g, d.id, setDim, dbg);
-     }
-+
-+    // 4) Transitional: snapshot + apply via Byggaren
-+    const solution = snapshotSolutionOfComponent(g, eid);
+-import {
+-  recomputeComponentFromScratch as recompute$,
+-  normalizeLocksForDiagonal     as normalize$,
+-  autosolveDiagonal_LockTwoLatest_AdjustOldest as autosolve$,
+-  listUserCenterEdgesInComponent as listUserCenters$
+-} from './solverEngine.js';
++import { solve } from './solverEngine.js';
+ import { applySolution } from './metricBuilder.js';
+
+   graph.onEdgeDimensionChanged?.((eid) => {
+     if (inBatch) return;
+     const g = gRef; const changed = g?.getEdge(eid); if (!changed) return;
+-
+-    // injicera en "säker" setter (hanterar inBatch)
+-    const setDim = (edgeId, dim, opts) => { inBatch = true; g.setEdgeDimension(edgeId, dim, opts); inBatch = false; };
+-    const dbg = { dumpComponentAroundEdge, dumpPathAndRecency };
+-
+-    // 1) Recompute hela komponenten
+-    recompute$(g, eid, setDim, dbg);
+-
+-    // 2) Normalisera lås runt alla usersatta diagonaler i samma komponent
+-    const diagsBefore = listUserCenters$(g, eid);
+-    if (!diagsBefore.length) return;
+-    for (const d of diagsBefore) normalize$(g, d.id, setDim, dbg);
+-
+-    // 3) Recompute + autosolve för kvarvarande user-diagonaler
+-    const diagsAfter = listUserCenters$(g, eid);
+-    for (const d of diagsAfter) {
+-      recompute$(g, d.id, setDim, dbg);
+-      autosolve$(g, d.id, setDim, dbg);
+-    }
+-
+-    // 4) Transitional: snapshot + apply via Byggaren (ingen beteendeförändring)
+-    const solution = snapshotSolutionOfComponent(g, eid);
+-    applySolution(g, solution);
++    const dbg = { dumpComponentAroundEdge, dumpPathAndRecency };
++    // Stateless lösning + applicera via Byggaren
++    const solution = solve(g, eid, dbg);
 +    applySolution(g, solution);
    });
- 
-   log('metric solver orchestrator ready (Phase-1: external engine)');
- }
- 
- // (alla beräkningsfunktioner ligger i src/measure/solverEngine.js)
-+
+
+-// (alla beräkningsfunktioner ligger i src/measure/solverEngine.js)
+-
+-// ──────────────────────────────────────────────────────────────────────────────
+-/** Snapshot helpers (transitional) */
+-// ──────────────────────────────────────────────────────────────────────────────
+-function snapshotSolutionOfComponent(g, seedEdgeId) {
+-  const { nodes, edges } = collectComponentFromEdge_local(g, seedEdgeId);
+-  const outNodes = new Map();
+-  const outEdges = new Map();
+-
+-  // Noder: meta.metric -> solution.nodes
+-  for (const nid of nodes) {
+-    const n = g.getNode(nid);
+-    const m = n?.meta?.metric || { x:0,y:0,z:0, known:false };
+-    outNodes.set(nid, { x:m.x||0, y:m.y||0, z:m.z||0, known: !!m.known });
+-  }
+-
+-  // Kanter: dim -> solution.edges
+-  for (const eid of edges) {
+-    const e = g.getEdge(eid);
+-    const dim = e?.dim ? { ...e.dim } : {};
+-    outEdges.set(eid, dim);
+-  }
+-
+-  return { nodes: outNodes, edges: outEdges };
+-}
+-
+-function collectComponentFromEdge_local(g, startEid) {
+-  const e0 = g.getEdge(startEid); if (!e0) return { nodes:[], edges:[] };
+-  const seenN = new Set(), seenE = new Set(); const q = [];
+-  seenN.add(e0.a); seenN.add(e0.b); q.push(e0.a, e0.b); seenE.add(startEid);
+-  while (q.length) {
+-    const nid = q.shift();
+-    const bag = g.incidentEdges(nid, {}); // alla kanter
+-    for (const e of bag) {
+-      if (!seenE.has(e.id)) seenE.add(e.id);
+-      const other = (e.a === nid) ? e.b : e.a;
+-      if (!seenN.has(other)) { seenN.add(other); q.push(other); }
+-    }
+-  }
+-  return { nodes:[...seenN], edges:[...seenE] };
+-}
++// (alla beräkningsfunktioner ligger i src/measure/solverEngine.js)
+diff --git a/src/measure/solverEngine.js b/src/measure/solverEngine.js
+--- a/src/measure/solverEngine.js
++++ b/src/measure/solverEngine.js
+
+-const TOL = 0.1; // mm
++const TOL = 0.1; // mm
+
+-export function recomputeComponentFromScratch(graph, edgeId, setEdgeDimension, opts = {}) {
 +// ──────────────────────────────────────────────────────────────────────────────
-+// Snapshot helpers (transitional)
++// PUBLIC: Stateless main entry — build a solution object, do not write to graph
 +// ──────────────────────────────────────────────────────────────────────────────
-+function snapshotSolutionOfComponent(g, seedEdgeId) {
-+  const { nodes, edges } = collectComponentFromEdge_local(g, seedEdgeId);
-+  const outNodes = new Map();
-+  const outEdges = new Map();
++export function solve(graph, seedEdgeId, opts = {}) {
++  if (!graph || !seedEdgeId) return { nodes:new Map(), edges:new Map() };
++  const solutionNodes = new Map(); // nid -> {x,y,z,known}
++  const solutionEdges = new Map(); // eid -> dim-object (to apply)
 +
-+  // Noder: meta.metric -> solution.nodes
-+  for (const nid of nodes) {
-+    const n = g.getNode(nid);
-+    const m = n?.meta?.metric || { x:0,y:0,z:0, known:false };
-+    outNodes.set(nid, { x:m.x||0, y:m.y||0, z:m.z||0, known: !!m.known });
++  // 1) recompute (read-only) for whole connected component
++  recomputeComponentFromScratch_READONLY(graph, seedEdgeId, solutionNodes, solutionEdges, opts);
++
++  // 2) lock normalization over all user-diagonals in component
++  const diagsBefore = listUserCenterEdgesInComponent(graph, seedEdgeId);
++  for (const d of diagsBefore) {
++    normalizeLocksForDiagonal_READONLY(graph, d.id, solutionNodes, solutionEdges, opts);
 +  }
 +
-+  // Kanter: dim -> solution.edges
-+  for (const eid of edges) {
-+    const e = g.getEdge(eid);
-+    const dim = e?.dim ? { ...e.dim } : {};
-+    outEdges.set(eid, dim);
++  // 3) recompute + autosolve for remaining user-diagonals
++  const diagsAfter = listUserCenterEdgesInComponent(graph, seedEdgeId);
++  for (const d of diagsAfter) {
++    recomputeComponentFromScratch_READONLY(graph, d.id, solutionNodes, solutionEdges, opts);
++    autosolveDiagonal_LockTwoLatest_AdjustOldest_READONLY(graph, d.id, solutionNodes, solutionEdges, opts);
 +  }
 +
-+  return { nodes: outNodes, edges: outEdges };
++  // 4) final recompute to settle derived values
++  recomputeComponentFromScratch_READONLY(graph, seedEdgeId, solutionNodes, solutionEdges, opts);
++  return { nodes: solutionNodes, edges: solutionEdges };
 +}
 +
-+function collectComponentFromEdge_local(g, startEid) {
-+  const e0 = g.getEdge(startEid); if (!e0) return { nodes:[], edges:[] };
-+  const seenN = new Set(), seenE = new Set(); const q = [];
-+  seenN.add(e0.a); seenN.add(e0.b); q.push(e0.a, e0.b); seenE.add(startEid);
-+  while (q.length) {
-+    const nid = q.shift();
-+    const bag = g.incidentEdges(nid, {}); // alla kanter
-+    for (const e of bag) {
-+      if (!seenE.has(e.id)) seenE.add(e.id);
-+      const other = (e.a === nid) ? e.b : e.a;
-+      if (!seenN.has(other)) { seenN.add(other); q.push(other); }
-+    }
++// ──────────────────────────────────────────────────────────────────────────────
++// READ-ONLY VARIANTS — write into solution maps, never into graph
++// ──────────────────────────────────────────────────────────────────────────────
++function recomputeComponentFromScratch_READONLY(graph, edgeId, solNodes, solEdges, opts = {}) {
+   const e0 = graph.getEdge(edgeId); if (!e0) return;
+ 
+-  const { nodes: compNodes, edges: compEdges } = collectComponentFromEdge(graph, edgeId);
++  const { nodes: compNodes, edges: compEdges } = collectComponentFromEdge(graph, edgeId);
+   if (!compNodes.length) return;
+ 
+-  // Nolla metric
+-  for (const nid of compNodes) {
+-    const n = graph.getNode(nid);
+-    n.meta = n.meta || {};
+-    n.meta.metric = { x:0, y:0, z:0, known:false };
+-  }
++  // Reset local metric
++  for (const nid of compNodes) solNodes.set(nid, { x:0, y:0, z:0, known:false });
+ 
+-  // Seed: origo om möjligt (annars första noden)
++  // Seed: world origin if any; else first node
+   const originId = findWorldOriginNode(graph, compNodes) ?? compNodes[0];
+-  graph.getNode(originId).meta.metric = { x:0, y:0, z:0, known:true };
++  solNodes.set(originId, { x:0, y:0, z:0, known:true });
+ 
+   const allEdges = compEdges.map(eid => graph.getEdge(eid)).filter(Boolean);
+ 
+   // Fas 1: propagation
+   let changed = true, guard = 0;
+   while (changed && guard < 3 * allEdges.length + 10) {
+     changed = false; guard++;
+ 
+     // A) construction (axelrät)
+     for (const ed of allEdges) {
+       if (ed.kind !== 'construction') continue;
+-      const val = validNumber(ed?.dim?.valueMm); if (val == null) continue;
++      const val = validNumber(getEdgeDim(graph, ed.id, solEdges)?.valueMm); if (val == null) continue;
+ 
+-      const a = graph.getNode(ed.a), b = graph.getNode(ed.b);
+-      const mA = a.meta.metric, mB = b.meta.metric;
++      const mA = solNodes.get(ed.a), mB = solNodes.get(ed.b);
+       const dir = edgeUnitDirWorld(graph, ed);
+       if (mA?.known && !mB?.known) {
+-        b.meta.metric = { x:mA.x+dir.x*val, y:mA.y+dir.y*val, z:mA.z+dir.z*val, known:true };
++        solNodes.set(ed.b, { x:mA.x+dir.x*val, y:mA.y+dir.y*val, z:mA.z+dir.z*val, known:true });
+         changed = true;
+-      } else if (!mA.known && mB.known) {
+-        a.meta.metric = { x:mB.x-dir.x*val, y:mB.y-dir.y*val, z:mB.z-dir.z*val, known:true };
++      } else if (!mA?.known && mB?.known) {
++        solNodes.set(ed.a, { x:mB.x-dir.x*val, y:mB.y-dir.y*val, z:mB.z-dir.z*val, known:true });
+         changed = true;
+       }
+     }
+ 
+     // B) center (endast user, ej diagonaler)
+     for (const ed of allEdges) {
+       if (ed.kind !== 'center') continue;
+-      if ((ed.dim?.source || null) !== 'user') continue;
++      const dim = getEdgeDim(graph, ed.id, solEdges);
++      if ((dim?.source || null) !== 'user') continue;
+       if (hasConstructionPathBetween(graph, ed.a, ed.b)) continue; // diagonal? då får den inte driva
+ 
+-      const val = validNumber(ed?.dim?.valueMm); if (val == null) continue;
++      const val = validNumber(dim?.valueMm); if (val == null) continue;
+ 
+-      const a = graph.getNode(ed.a), b = graph.getNode(ed.b);
+-      const mA = a.meta.metric, mB = b.meta.metric;
++      const mA = solNodes.get(ed.a), mB = solNodes.get(ed.b);
+       const dir = edgeUnitDirWorld(graph, ed);
+       if (mA?.known && !mB?.known) {
+-        b.meta.metric = { x:mA.x+dir.x*val, y:mA.y+dir.y*val, z:mA.z+dir.z*val, known:true };
++        solNodes.set(ed.b, { x:mA.x+dir.x*val, y:mA.y+dir.y*val, z:mA.z+dir.z*val, known:true });
+         changed = true;
+-      } else if (!mA.known && mB.known) {
+-        a.meta.metric = { x:mB.x-dir.x*val, y:mB.y-dir.y*val, z:mB.z-dir.z*val, known:true };
++      } else if (!mA?.known && mB?.known) {
++        solNodes.set(ed.a, { x:mB.x-dir.x*val, y:mB.y-dir.y*val, z:mB.z-dir.z*val, known:true });
+         changed = true;
+       }
+     }
+   }
+ 
+   // Fas 2: derive/validera dimensioner
+   for (const ed of allEdges) {
+-    const aM = graph.getNode(ed.a)?.meta?.metric;
+-    const bM = graph.getNode(ed.b)?.meta?.metric;
++    const aM = solNodes.get(ed.a);
++    const bM = solNodes.get(ed.b);
+     if (!aM?.known || !bM?.known) continue;
+ 
+     const d = dist3(aM, bM);
+-    const dim = ed.dim || null;
++    const dim = getEdgeDim(graph, ed.id, solEdges) || null;
+     const isUser = dim?.source === 'user';
+ 
+     if (isUser) {
+       const delta = Math.abs((dim?.valueMm ?? 0) - d);
+       const hadConflict = !!dim?.conflict;
+-      if (delta > TOL && !hadConflict) {
+-        setEdgeDimension(ed.id, { ...dim, conflict: { deltaMm: delta } }, { silent: true });
+-      } else if (delta <= TOL && hadConflict) {
+-        setEdgeDimension(ed.id, { ...dim, conflict: null }, { silent: true });
+-      }
++      const next = { ...dim };
++      next.conflict = (delta > TOL) ? { deltaMm: delta } : null;
++      solEdges.set(ed.id, next);
+     } else {
+-      setEdgeDimension(ed.id, {
++      solEdges.set(ed.id, {
+         valueMm: d,
+         mode: dim?.mode || 'aligned',
+         label: dim?.label ?? null,
+         source: 'derived',
+         derivedFrom: 'metric',
+         conflict: null
+-      }, { silent: false });
++      });
+     }
+   }
+ 
+-  opts.dumpComponentAroundEdge?.(graph, edgeId, { title: 'AFTER recompute' });
++  opts.dumpComponentAroundEdge?.(graph, edgeId, { title: 'AFTER recompute (READONLY)' });
+ }
+ 
+-export function normalizeLocksForDiagonal(graph, diagEid, setEdgeDimension, opts = {}) {
++function normalizeLocksForDiagonal_READONLY(graph, diagEid, solNodes, solEdges, opts = {}) {
+   const eD = graph.getEdge(diagEid); if (!eD || eD.kind !== 'center') return;
+-  const dimD = eD.dim || null;
++  const dimD = getEdgeDim(graph, eD.id, solEdges) || eD.dim || null;
+   if (!dimD || dimD.source !== 'user') return;
+ 
+   const path = findManhattanPath(graph, eD.a, eD.b);
+   if (!path || path.edges.length === 0) return;
+ 
+   const axesUsed = new Set();
+   const legs = [];
+   for (let i=0;i<path.edges.length;i++){
+     const eid = path.edges[i];
+     const ed  = graph.getEdge(eid);
+     if (!ed || ed.kind !== 'construction') continue;
+
+-  // Demota alla usersatta som inte är i "keep"
++  // Demota alla usersatta som inte är i "keep"
+   let demotedAny = false;
+   for (const c of candidates) {
+     if (!keep.has(c.eid) && c.dim?.source === 'user') {
+-      demoteOneEdge(graph, c.eid, setEdgeDimension); // construction behåller värde; diag nollas
++      demoteOneEdge_READONLY(graph, c.eid, solNodes, solEdges); // construction behåller värde; diag nollas
+       demotedAny = true;
+     }
+   }
+ 
+   if (demotedAny) {
+-    // Fyll derived-värden efter demotion
+-    recomputeComponentFromScratch(graph, diagEid, setEdgeDimension, opts);
++    // Fyll derived-värden efter demotion
++    recomputeComponentFromScratch_READONLY(graph, diagEid, solNodes, solEdges, opts);
+   }
+ }
+ 
+-export function autosolveDiagonal_LockTwoLatest_AdjustOldest(graph, diagEid, setEdgeDimension, opts = {}) {
++function autosolveDiagonal_LockTwoLatest_AdjustOldest_READONLY(graph, diagEid, solNodes, solEdges, opts = {}) {
+   const eD = graph.getEdge(diagEid); if (!eD) return;
+-  const dimD = eD.dim || null;
++  const dimD = getEdgeDim(graph, eD.id, solEdges) || eD.dim || null;
+   if (!dimD || dimD.source !== 'user') return;
+   if (!validNumber(dimD.valueMm)) return;
+ 
+   const path = findManhattanPath(graph, eD.a, eD.b);
+   if (!path || path.edges.length === 0) return;
+
+-  // Om pick var user → demota (behåll värde om construction)
++  // Om pick var user → demota (behåll värde om construction)
+   if (pick.dim?.source === 'user') {
+-    demoteOneEdge(graph, pick.eid, setEdgeDimension);
+-    recomputeComponentFromScratch(graph, diagEid, setEdgeDimension, opts);
++    demoteOneEdge_READONLY(graph, pick.eid, solNodes, solEdges);
++    recomputeComponentFromScratch_READONLY(graph, diagEid, solNodes, solEdges, opts);
+   }
+ 
+   // Totalsummor mellan pathens ändpunkter
+-  const startM = graph.getNode(path.nodes[0])?.meta?.metric;
+-  const endM   = graph.getNode(path.nodes[path.nodes.length-1])?.meta?.metric;
++  const startM = solNodes.get(path.nodes[0]);
++  const endM   = solNodes.get(path.nodes[path.nodes.length-1]);
+   if (!startM?.known || !endM?.known) return;
+
+-  const segStart = graph.getNode(path.nodes[idx])?.meta?.metric;
+-  const segEnd   = graph.getNode(path.nodes[idx+1])?.meta?.metric;
++  const segStart = solNodes.get(path.nodes[idx]);
++  const segEnd   = solNodes.get(path.nodes[idx+1]);
+   if (!segStart?.known || !segEnd?.known) return;
+
+-  writeDerivedLen(graph, pick.eid, newSegLen, setEdgeDimension);
+-  opts.dumpComponentAroundEdge?.(graph, diagEid, { title: 'AFTER autosolve write' });
+-
+-  recomputeComponentFromScratch(graph, diagEid, setEdgeDimension, opts);
+-  opts.dumpComponentAroundEdge?.(graph, diagEid, { title: 'AFTER final recompute' });
++  writeDerivedLen_READONLY(graph, pick.eid, newSegLen, solEdges);
++  opts.dumpComponentAroundEdge?.(graph, diagEid, { title: 'AFTER autosolve write (READONLY)' });
++
++  recomputeComponentFromScratch_READONLY(graph, diagEid, solNodes, solEdges, opts);
++  opts.dumpComponentAroundEdge?.(graph, diagEid, { title: 'AFTER final recompute (READONLY)' });
+ }
+ 
+-// Hjälpare som behövs i metricSolver också
+-export function listUserCenterEdgesInComponent(graph, edgeId) {
++// Hjälpare som behövs i solve()
++export function listUserCenterEdgesInComponent(graph, edgeId) {
+   const { edges } = collectComponentFromEdge(graph, edgeId);
+   const out = [];
+   for (const eid of edges) {
+     const e = graph.getEdge(eid);
+     if (!e || e.kind !== 'center') continue;
+-    if ((e.dim?.source || null) === 'user') out.push(e);
++    if ((e.dim?.source || null) === 'user') out.push(e);
+   }
+   return out;
+ }
+
+ function edgeCurrentLengthFromMetricOrWorld(g, e) {
+-  const aM = g.getNode(e.a)?.meta?.metric;
+-  const bM = g.getNode(e.b)?.meta?.metric;
+-  if (aM?.known && bM?.known) return dist3(aM, bM);
++  const aM = g.getNode(e.a)?.meta?.metric;
++  const bM = g.getNode(e.b)?.meta?.metric;
++  if (aM?.known && bM?.known) return dist3(aM, bM);
+
+ function demoteOnedge(g, eid, setEdgeDimension) {
+-  const ed = g.getEdge(eid);
++  const ed = g.getEdge(eid);
+   const prev = ed?.dim || {};
+   const isConstruction = ed?.kind === 'construction';
+
+-  setEdgeDimension(eid, {
+-    valueMm: isConstruction ? keepValue : null,
+-    mode: prev.mode || 'aligned',
+-    label: prev.label ?? null,
+-    source: 'derived',
+-    derivedFrom: { kind:'autoDemote', was:'user' },
+-    conflict: null
+-  }, { silent:false });
++  // (stateful variant – left for backwards compat if still used somewhere)
++  g.setEdgeDimension(eid, {
++    valueMm: isConstruction ? keepValue : null,
++    mode: prev.mode || 'aligned',
++    label: prev.label ?? null,
++    source: 'derived',
++    derivedFrom: { kind:'autoDemote', was:'user' },
++    conflict: null
++  }, { silent:false });
+ }
+ 
+-function writeDerivedLen(g, eid, valueMm, setEdgeDimension) {
+-  const dim = g.getEdge(eid)?.dim || {};
+-  setEdgeDimension(eid, {
+-    valueMm,
+-    mode: dim?.mode || 'aligned',
+-    label: dim?.label ?? null,
+-    source: 'derived',
+-    derivedFrom: { kind:'lockTwo_adjustOldest' },
+-    conflict: null
+-  }, { silent:false });
++function writeDerivedLen(g, eid, valueMm, setEdgeDimension) {
++  const dim = g.getEdge(eid)?.dim || {};
++  g.setEdgeDimension(eid, {
++    valueMm,
++    mode: dim?.mode || 'aligned',
++    label: dim?.label ?? null,
++    source: 'derived',
++    derivedFrom: { kind:'lockTwo_adjustOldest' },
++    conflict: null
++  }, { silent:false });
+ }
++
++// ── READONLY writer helpers ───────────────────────────────────────────────────
++function demoteOneEdge_READONLY(g, eid, solNodes, solEdges) {
++  const ed = g.getEdge(eid);
++  const prev = getEdgeDim(g, eid, solEdges) || ed?.dim || {};
++  const isConstruction = ed?.kind === 'construction';
++  let keepValue = prev.valueMm;
++  if (!(typeof keepValue === 'number' && isFinite(keepValue))) {
++    keepValue = edgeCurrentLengthFromMetricOrWorld(g, ed);
 +  }
-+  return { nodes:[...seenN], edges:[...seenE] };
++  solEdges.set(eid, {
++    valueMm: isConstruction ? keepValue : null,
++    mode: prev.mode || 'aligned',
++    label: prev.label ?? null,
++    source: 'derived',
++    derivedFrom: { kind:'autoDemote', was:'user' },
++    conflict: null
++  });
++}
++function writeDerivedLen_READONLY(g, eid, valueMm, solEdges) {
++  const dim = getEdgeDim(g, eid, solEdges) || {};
++  solEdges.set(eid, {
++    valueMm,
++    mode: dim?.mode || 'aligned',
++    label: dim?.label ?? null,
++    source: 'derived',
++    derivedFrom: { kind:'lockTwo_adjustOldest' },
++    conflict: null
++  });
++}
++function getEdgeDim(g, eid, solEdges) {
++  return solEdges.get(eid) ?? g.getEdge(eid)?.dim ?? null;
 +}

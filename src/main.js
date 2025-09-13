@@ -13,19 +13,45 @@ import { createSnapper } from './snap/snapper.js';
 import { createDrawManager } from './draw/drawManager.js';
 import { installInputHandlers } from './input/inputHandlers.js';
 import { state } from './state/appState.js';
-//import * as triDerive from './measure/deriveTriangles.js';
-import * as metricSolver from './measure/metricSolver.js';
 
-import { createMetricGraphOverlay } from './debug/metricGraphOverlay.js';
+// Stateless engine + builder
+import { solve } from './measure/solverEngine.js';
+import { applySolution } from './measure/metricBuilder.js';
+
+// Debug traces (valfritt)
+import { dumpComponentAroundEdge, dumpPathAndRecency } from './debug/metricTrace.js';
+
+// Debug overlay för mentala grafen (utkommenterad – toggla in vid behov)
+ import { createMetricGraphOverlay } from './debug/metricGraphOverlay.js';
 
 // Graph
 const graph = createGraph();
 window.graph = graph; // (valfritt) för snabb debug i konsolen
 
+window.solve = solve;
 
+// Koppla ihop: när en dimension ändras → räkna stateless → applicera i ett svep
+let inBatch = false;
+graph.onEdgeDimensionChanged?.((eid) => {
+  if (inBatch) return;
+  const changed = graph.getEdge(eid);
+  if (!changed) return;
 
-//triDerive.init({ graph });
-metricSolver.init({ graph });
+  const dbg = { dumpComponentAroundEdge, dumpPathAndRecency };
+
+  // 1) Beräkna stateless lösning
+  const solution = solve(graph, eid, dbg);
+  
+
+  // 2) Applicera säkert (undvik reentrancy)
+  inBatch = true;
+  applySolution(graph, solution, { silent: false });
+  inBatch = false;
+  dumpComponentAroundEdge(graph, eid, { title: 'AFTER applySolution (chains)' });
+
+  // 3) (valfritt) uppdatera metric overlay om den är aktiverad
+  METRIC_DEBUG?.update?.();
+});
 
 // Scene
 const { scene, camera, renderer3D, modelGroup, permanentVertices, gridHelper, pickPlaneMesh } = createScene();
@@ -55,25 +81,28 @@ const draw = createDrawManager({
   graph,
 });
 
-installInputHandlers({ THREE, scene, camera, renderer3D, controls, overlay, picker, snapper, draw, modelGroup, permanentVertices, gridHelper, pickPlaneMesh });
+installInputHandlers({
+  THREE, scene, camera, renderer3D, controls, overlay,
+  picker, snapper, draw, modelGroup, permanentVertices, gridHelper, pickPlaneMesh
+});
 
 (async function init() {
   await enterInspectMode({ controls });
   await resetIsoAndFitAll({ scene, modelGroup, controls, camera });
 })();
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Debug overlay för mentala grafen (UTKOMMENTERAD)
+// ──────────────────────────────────────────────────────────────────────────────
 
-
-// Debug overlay för mentala grafen
 const METRIC_DEBUG = createMetricGraphOverlay({
   scene,
   graph,
-  mmToWorld: 0.08,   // justera vid behov så att den inte blir jättestor
-  visible: true      // börja synlig – eller false om du vill toggla manuellt
+  mmToWorld: 0.08,
+  visible: true
 });
-window.METRIC_DEBUG = METRIC_DEBUG; // så du kan skriva METRIC_DEBUG.toggle() i konsolen
+window.METRIC_DEBUG = METRIC_DEBUG;
 
-// Uppdatera overlayn när mått ändras
 graph.onEdgeDimensionChanged?.(() => {
   METRIC_DEBUG.update();
 });
@@ -81,7 +110,6 @@ graph.onEdgeDimensionChanged?.(() => {
 // ... efter att du byggt scenen första gången:
 METRIC_DEBUG.update();
 
-// (valfritt) lägg till en enkel toggle med t.ex. F9
 window.addEventListener('keydown', (e)=>{
   if (e.code === 'F9') {
     METRIC_DEBUG.toggle();
@@ -89,6 +117,8 @@ window.addEventListener('keydown', (e)=>{
   }
 });
 
+
+// Render loop
 function animate() {
   requestAnimationFrame(animate);
   controls.update(clock.getDelta());
