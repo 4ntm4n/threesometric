@@ -1,6 +1,5 @@
 // src/measure/dimensionTool.js
 import { THREE } from '../platform/three.js';
-import { state } from '../state/appState.js';
 
 let camera, overlay, graph, edgeIdToLine;
 let active = false;
