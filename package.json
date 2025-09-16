@@ -4,7 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+     "test:contract": "node tests/runContractTests.js",
+    "test:contract:one": "node tests/runContractTests.js --pattern",
+    "test:state": "node -e \"import('./src/calculation/stateManager.js').then(m=>console.log('stateManager loaded'))\"",
+    "test:calc": "node -e \"import('./src/calculation/calculator.js').then(m=>console.log('calculator loaded'))\"",
     "dev": "vite"
   },
   "repository": {
