@@ -1,0 +1,86 @@
+{
+  "name": "A - Diagonal stem + T (perp + planeRef)",
+  "nodes": [
+    {
+      "id": "n1",
+      "base": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "meta": {
+        "isAnchor": true
+      }
+    },
+    {
+      "id": "n2",
+      "base": {
+        "x": 1,
+        "y": 0,
+        "z": 1
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    },
+    {
+      "id": "n3",
+      "base": {
+        "x": 1,
+        "y": 0,
+        "z": 2
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "a": "n1",
+      "b": "n2",
+      "kind": "center",
+      "dim": {
+        "valueMm": 1000,
+        "mode": "aligned",
+        "source": "user",
+        "userEditedAt": 0
+      },
+      "meta": {
+        "axisLock": "Z"
+      }
+    },
+    {
+      "id": "e2",
+      "a": "n2",
+      "b": "n3",
+      "kind": "center",
+      "dim": {
+        "valueMm": 400,
+        "mode": "aligned",
+        "source": "user",
+        "userEditedAt": 0
+      },
+      "meta": {
+        "perpTo": {
+          "ref": "e1"
+        },
+        "coplanarWith": {
+          "type": "byEdgeUp",
+          "ref": "e1",
+          "up": "globalUp"
+        }
+      }
+    }
+  ]
+}

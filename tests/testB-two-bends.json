@@ -1,0 +1,123 @@
+{
+  "name": "B - Two bends with angles",
+  "nodes": [
+    {
+      "id": "n1",
+      "base": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "meta": {
+        "isAnchor": true
+      }
+    },
+    {
+      "id": "n2",
+      "base": {
+        "x": 1,
+        "y": 0,
+        "z": 0
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    },
+    {
+      "id": "n3",
+      "base": {
+        "x": 2,
+        "y": 0,
+        "z": 0
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    },
+    {
+      "id": "n4",
+      "base": {
+        "x": 3,
+        "y": 0,
+        "z": 0
+      },
+      "offset": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "a": "n1",
+      "b": "n2",
+      "kind": "center",
+      "dim": {
+        "valueMm": 1000,
+        "mode": "aligned",
+        "source": "user",
+        "userEditedAt": 0
+      },
+      "meta": {
+        "axisLock": "Z"
+      }
+    },
+    {
+      "id": "e2",
+      "a": "n2",
+      "b": "n3",
+      "kind": "center",
+      "dim": {
+        "valueMm": 500,
+        "mode": "aligned",
+        "source": "user",
+        "userEditedAt": 0
+      },
+      "meta": {
+        "angleTo": {
+          "ref": "e1",
+          "deg": 30
+        },
+        "coplanarWith": {
+          "type": "byEdgeUp",
+          "ref": "e1",
+          "up": "globalUp"
+        }
+      }
+    },
+    {
+      "id": "e3",
+      "a": "n3",
+      "b": "n4",
+      "kind": "center",
+      "dim": {
+        "valueMm": 700,
+        "mode": "aligned",
+        "source": "user",
+        "userEditedAt": 0
+      },
+      "meta": {
+        "angleTo": {
+          "ref": "e2",
+          "deg": -45
+        },
+        "coplanarWith": {
+          "type": "byEdgeUp",
+          "ref": "e2",
+          "up": "globalUp"
+        }
+      }
+    }
+  ]
+}

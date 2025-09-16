@@ -1,0 +1,17 @@
+# Gör alla textfiler till LF i arbetskopia och i commits
+* text=auto eol=lf
+
+# Behåll CRLF för Windows-skript om du använder dem
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binära filer (ingen EOL-konvertering)
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.pdf binary
+*.zip binary
