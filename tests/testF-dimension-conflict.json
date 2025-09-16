@@ -1,0 +1,25 @@
+{
+  "name": "F - Dimension conflict (Pythagoras violation)",
+  "nodes": [
+    { "id": "n1", "base": { "x": 0, "y": 0, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 }, "meta": { "isAnchor": true } },
+    { "id": "n2", "base": { "x": 1, "y": 0, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 } },
+    { "id": "n3", "base": { "x": 0, "y": 1, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 } }
+  ],
+  "edges": [
+    {
+      "id": "e1", "a": "n1", "b": "n2", "kind": "construction",
+      "dim": { "valueMm": 100, "mode": "aligned", "source": "user" },
+      "meta": { "axisLock": "X" }
+    },
+    {
+      "id": "e2", "a": "n1", "b": "n3", "kind": "construction",
+      "dim": { "valueMm": 100, "mode": "aligned", "source": "user" },
+      "meta": { "axisLock": "Y" }
+    },
+    {
+      "id": "e3", "a": "n2", "b": "n3", "kind": "center",
+      "dim": { "valueMm": 300, "mode": "aligned", "source": "user" },
+      "meta": { "coplanarWith": { "type": "byEdges", "refs": ["e1", "e2"] } }
+    }
+  ]
+}

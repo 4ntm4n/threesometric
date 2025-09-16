@@ -17,144 +17,84 @@
  *  - 'dimension_missing'
  */
 
-export function isGraphSolvable(graph) {
-  return checkGraphSolvable(graph).ok === true;
-}
-
 export function checkGraphSolvable(graph) {
-  // 0) Basdata
-  const nodes = graph.allNodes?.();
-  const edges = graph.allEdges?.();
-  if (!nodes || !edges) return { ok:false, reason:'disconnected_subgraph', details:{ msg:'no nodes/edges' } };
+  const nodes = graph.allNodes();
+  const edges = graph.allEdges();
 
-  // 1) Exakt en anchor
-  const anchors = [...nodes.values()].filter(n => n?.meta?.isAnchor === true);
-  if (anchors.length !== 1) return { ok:false, reason:'anchor_count', details:{ count: anchors.length } };
-  const anchor = anchors[0];
+  // 1. Anchor check
+  const anchors = [...nodes.values()].filter(n => n?.meta?.isAnchor);
+  if (anchors.length !== 1) {
+    return { ok: false, reason: 'anchor_count', details: { count: anchors.length } };
+  }
 
-  // 2) "Absolut referens" nära ankaret:
-  //    Första utkast: kräv att minst EN kant incident till ankaret har meta.axisLock.
-  //    (Vid behov kan vi senare tillåta en kort kedja som implicit fixerar första framen.)
-  const incidentToAnchor = incidentEdgesOf(graph, anchor.id);
-  const hasAxisLockNearAnchor = incidentToAnchor.some(e => !!e?.meta?.axisLock);
-  if (!hasAxisLockNearAnchor) return { ok:false, reason:'no_absolute_reference', details:{ anchor: anchor.id } };
+  // 2. Absolut referens (axisLock eller liknande)
+  const hasAbsolute = [...edges.values()].some(e => e?.meta?.axisLock);
+  if (!hasAbsolute) {
+    return { ok: false, reason: 'no_absolute_reference' };
+  }
 
-  // 3) Traversera komponenten från ankaret och testa "entydighet" för varje ny nod
-  //    - placerad := noder vi kan positionera (ankaret först)
-  //    - reachable := alla noder i samma komponent via center/ construction kanter (topologi)
-  const reachable = bfsReachableNodeIds(graph, anchor.id);
-  const placed = new Set([anchor.id]);
+  // 3. Traverseringskontroll (enkelt: kolla att alla noder är nåbara)
+  const visited = new Set();
+  function dfs(nid) {
+    if (visited.has(nid)) return;
+    visited.add(nid);
+    for (const { otherId } of graph.neighbors(nid)) {
+      dfs(otherId);
+    }
+  }
+  dfs(anchors[0].id);
+  if (visited.size !== nodes.size) {
+    return { ok: false, reason: 'disconnected_subgraph' };
+  }
 
-  // Hjälpfunktioner för constraints
-  const hasDim = (e) => typeof e?.dim?.valueMm === 'number' && isFinite(e.dim.valueMm) && e.dim.valueMm > 0;
-  const hasDirConstraint = (e) =>
-    !!(e?.meta?.axisLock || e?.meta?.perpTo || e?.meta?.parallelTo || e?.meta?.angleTo);
-  const refEdgesKnown = (constraint, placedSet) => {
-    if (!constraint) return false;
-    const refId = constraint.ref ?? constraint?.angleTo?.ref ?? null;
-    if (!refId) return true; // axisLock/förenklade fall
-    const ref = edges.get(refId);
-    if (!ref) return false;
-    return placedSet.has(ref.a) && placedSet.has(ref.b);
-  };
-  const edgeHasPlane = (e) => !!e?.meta?.coplanarWith;
-  const nodePlaneRef = (nid) => {
-    const n = nodes.get(nid); if (!n) return null;
-    return n?.meta?.tee?.planeRef || null;
-  };
+  // 4. Kontrollera att mått finns där de behövs
+  for (const e of edges.values()) {
+    if (!e.dim || typeof e.dim.valueMm !== 'number' || !(e.dim.valueMm > 0)) {
+      return { ok: false, reason: 'dimension_missing', details: { edgeId: e.id } };
+    }
+  }
 
-  // Förklaring logik:
-  //  - En ny nod N anses "placerbar" om något av nedan är sant:
-  //    A) Det finns en känd granne P med en dimensionerad kant e(P,N) + ENTINGEN:
-  //       A1) e.meta.axisLock, ELLER
-  //       A2) e har relativ riktning (perp/parallel/angleTo) där referens-kanten är känd
-  //           och ett plan finns (på e eller på N) för att entydiggöra 3D-riktningen
-  //    B) Triangulering: N har minst två dimensionerade kanter mot TVÅ olika kända grannar
-  //       OCH det finns en planreferens (på N eller på minst en av kanterna) för att välja punkt.
-  //
-  //  Notera: Vi räknar inte koordinater här, endast om constraints räcker för entydighet.
-  //
-  let progress = true;
-  const blockedReasons = new Map(); // nodeId -> reason string
+  // 5. Konsistenskontroll av trianglar
+  // För varje triplet av noder som bildar en triangel (alla tre kanter finns och har mått):
+  const edgeMap = new Map();
+  for (const e of edges.values()) {
+    edgeMap.set([e.a, e.b].sort().join('-'), e);
+  }
 
-  while (progress) {
-    progress = false;
+  for (const n1 of nodes.keys()) {
+    for (const n2 of nodes.keys()) {
+      if (n2 <= n1) continue;
+      for (const n3 of nodes.keys()) {
+        if (n3 <= n2) continue;
 
-    for (const nid of reachable) {
-      if (placed.has(nid)) continue;
+        const e12 = edgeMap.get([n1,n2].sort().join('-'));
+        const e23 = edgeMap.get([n2,n3].sort().join('-'));
+        const e13 = edgeMap.get([n1,n3].sort().join('-'));
+        if (!e12 || !e23 || !e13) continue;
 
-      const inc = incidentEdgesOf(graph, nid);
-      const toKnown = inc.filter(e => placed.has(otherOf(e, nid)));
-      if (toKnown.length === 0) {
-        blockedReasons.set(nid, 'disconnected_subgraph');
-        continue;
-      }
+        const a = e12.dim?.valueMm;
+        const b = e23.dim?.valueMm;
+        const c = e13.dim?.valueMm;
+        if (!(a && b && c)) continue;
 
-      // A) En dimensionerad kant till känd granne + riktning (absolut eller relativ) + ev. plan
-      let okA = false;
-      for (const e of toKnown) {
-        if (!hasDim(e)) continue;
-        // A1) Absolut (axisLock)
-        if (e?.meta?.axisLock) { okA = true; break; }
-
-        // A2) Relativ: kräver dirConstraint + ref-kant känd + plan
-        const hasDir = hasDirConstraint(e);
-        if (!hasDir) continue;
-
-        const c = e.meta.angleTo || e.meta.perpTo || e.meta.parallelTo || null;
-        const refsKnown = refEdgesKnown(c, placed);
-        if (!refsKnown) continue;
-
-        const planeAvailable = edgeHasPlane(e) || !!nodePlaneRef(nid);
-        if (!planeAvailable) continue;
-
-        okA = true; break;
-      }
-
-      // B) Triangulering: två dimensionerade kanter mot två olika kända grannar + plan
-      let okB = false;
-      {
-        const dimToKnown = toKnown.filter(hasDim);
-        const distinctKnownNeighbors = new Set(dimToKnown.map(e => otherOf(e, nid)));
-        if (dimToKnown.length >= 2 && distinctKnownNeighbors.size >= 2) {
-          const planeAvailable = !!nodePlaneRef(nid) || dimToKnown.some(edgeHasPlane);
-          if (planeAvailable) okB = true;
-        }
-      }
-
-      if (okA || okB) {
-        placed.add(nid);
-        blockedReasons.delete(nid);
-        progress = true;
-      } else {
-        // Fyll på diagnoses (om vi ännu inte har en mer specifik)
-        if (!blockedReasons.has(nid)) {
-          // Prioritera saknad dimension vs saknad plan vs allmänt otillräckliga constraints
-          if (toKnown.some(e => !hasDim(e))) {
-            blockedReasons.set(nid, 'dimension_missing');
-          } else if (
-            toKnown.some(e => hasDim(e) && hasDirConstraint(e) && refEdgesKnown(e.meta.angleTo||e.meta.perpTo||e.meta.parallelTo, placed) && !edgeHasPlane(e)) &&
-            !nodePlaneRef(nid)
-          ) {
-            blockedReasons.set(nid, 'ambiguous_location');
-          } else {
-            blockedReasons.set(nid, 'insufficient_constraints_at_node');
-          }
+        // Triangelolikheten: summan av två sidor > tredje
+        if (a + b <= c + 1e-6 || a + c <= b + 1e-6 || b + c <= a + 1e-6) {
+          return {
+            ok: false,
+            reason: 'dimension_conflict',
+            details: { nodes: [n1,n2,n3], edges: [e12.id, e23.id, e13.id] }
+          };
         }
       }
     }
   }
 
-  // 4) Bedömning
-  if (placed.size === reachable.length) {
-    return { ok:true };
-  }
+  // Om allt gick bra
+  return { ok: true };
+}
 
-  // Om vi inte lyckats placera alla noder i komponenten:
-  // Finn första blockerade nod och returnera dess reason
-  const firstBlocked = reachable.find(nid => !placed.has(nid));
-  const reason = blockedReasons.get(firstBlocked) || 'insufficient_constraints_at_node';
-  return { ok:false, reason, details:{ nodeId:firstBlocked } };
+export function isGraphSolvable(graph) {
+  return checkGraphSolvable(graph).ok;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

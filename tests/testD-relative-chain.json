@@ -1,0 +1,38 @@
+{
+  "name": "D - Relative chain with mixed constraints",
+  "nodes": [
+    { "id": "n1", "base": { "x": 0, "y": 0, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 }, "meta": { "isAnchor": true } },
+    { "id": "n2", "base": { "x": 0, "y": 1, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 } },
+    { "id": "n3", "base": { "x": 0, "y": 2, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 } },
+    { "id": "n4", "base": { "x": 0, "y": 3, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 } },
+    { "id": "n5", "base": { "x": 0, "y": 4, "z": 0 }, "offset": { "x": 0, "y": 0, "z": 0 } }
+  ],
+  "edges": [
+    {
+      "id": "e1", "a": "n1", "b": "n2", "kind": "center",
+      "dim": { "valueMm": 1000, "mode": "aligned", "source": "user" },
+      "meta": { "axisLock": "Y" }
+    },
+    {
+      "id": "e2", "a": "n2", "b": "n3", "kind": "center",
+      "dim": { "valueMm": 500, "mode": "aligned", "source": "user" },
+      "meta": { "parallelTo": { "ref": "e1" } }
+    },
+    {
+      "id": "e3", "a": "n3", "b": "n4", "kind": "center",
+      "dim": { "valueMm": 400, "mode": "aligned", "source": "user" },
+      "meta": {
+        "angleTo": { "ref": "e2", "deg": 45 },
+        "coplanarWith": { "type": "byEdgeUp", "ref": "e2", "up": "globalUp" }
+      }
+    },
+    {
+      "id": "e4", "a": "n4", "b": "n5", "kind": "center",
+      "dim": { "valueMm": 300, "mode": "aligned", "source": "user" },
+      "meta": {
+        "perpTo": { "ref": "e3" },
+        "coplanarWith": { "type": "byEdgeUp", "ref": "e3", "up": "globalUp" }
+      }
+    }
+  ]
+}
