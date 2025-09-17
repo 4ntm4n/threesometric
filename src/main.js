@@ -50,6 +50,25 @@ const draw = createDrawManager({
   graph,
 });
 
+//Metric View
+let metricVisible = false;
+window.addEventListener('keydown', async (e) => {
+  if (e.code === 'F9') {  // Ändrat från KeyM till F9
+    metricVisible = !metricVisible;
+    draw.toggleMetricView(metricVisible);
+    if (metricVisible) {
+      const ok = await draw.updateMetricView();
+      if (!ok) {
+        // Gick inte att räkna → studsa tillbaka till schematisk
+        metricVisible = false;
+        draw.toggleMetricView(false);
+        // Valfritt: visa ett felmeddelande här
+        console.warn("Kunde inte skapa metrisk vy, återgår till schematisk vy.");
+      }
+    }
+  }
+});
+
 installInputHandlers({
   THREE, scene, camera, renderer3D, controls,
   overlay, picker, snapper, draw,

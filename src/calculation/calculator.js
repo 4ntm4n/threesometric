@@ -107,58 +107,86 @@ function findPlaneRefForNode(graph, edges, coords, nodeId){
 }
 
 // Bestäm riktning för kant utifrån constraints (enhetsvektor i 3D)
-function edgeDirectionFromConstraints(graph, edges, coords, fromNodeId, edge){
-  // Absolut lås
-  if (edge?.meta?.axisLock) {
-    const ax = edge.meta.axisLock;
-    if (ax === 'X') return v(1,0,0);
-    if (ax === 'Y') return v(0,1,0);
-    if (ax === 'Z') return v(0,0,1);
+// + matcha tecken mot den schematiska ritningen (hint)
+function edgeDirectionFromConstraints(graph, edges, coords, fromNodeId, edge) {
+  if (!edge) return null;
+  const meta = edge.meta || {};
+
+  // Vilken nod är "to" sett från fromNodeId?
+  const toNodeId = (edge.a === fromNodeId) ? edge.b : edge.a;
+
+  // Schematiskt hint: vektor i den riktning användaren ritade
+  let hintDir = null;
+  const fromW = graph.getNodeWorldPos?.(fromNodeId);
+  const toW   = graph.getNodeWorldPos?.(toNodeId);
+  if (fromW && toW) {
+    const h = sub({x:toW.x,y:toW.y,z:toW.z}, {x:fromW.x,y:fromW.y,z:fromW.z});
+    if (len(h) > EPS) hintDir = norm(h);
   }
 
-  const meta = edge?.meta || {};
-  const hasParallel = !!meta.parallelTo;
-  const hasPerp     = !!meta.perpTo;
-  const hasAngle    = !!meta.angleTo;
+  // 0) AxisLock (absolut global riktning)
+  if (meta.axisLock) {
+    let dir =
+      meta.axisLock === 'X' ? v(1,0,0) :
+      meta.axisLock === 'Y' ? v(0,1,0) :
+      meta.axisLock === 'Z' ? v(0,0,1) : null;
+    if (!dir) return null;
 
-  // Hjälp: hämta plan-normal:
+    // Matcha tecken mot schematisk hint om den finns
+    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Om vi står vid edge.b och ska peka "utåt"
+    if (fromNodeId === edge.b) dir = mul(dir, -1);
+    return dir;
+  }
+
+  // Hjälp: hämta plan-normal (om behövs)
   const planeRef = meta.coplanarWith || findPlaneRefForNode(graph, edges, coords, fromNodeId);
   const n = planeNormalFromRef(planeRef, edges, coords);
 
-  // Prioritet: angleTo > perpTo > parallelTo
-  if (hasAngle) {
-    const refId = meta.angleTo.ref;
-    const deg   = meta.angleTo.deg || 0;
-    const refDir = refEdgeDirection(edges, coords, refId);
+  // 1) angleTo (rotera refDir kring planets normal)
+  if (meta.angleTo && typeof meta.angleTo.ref === 'string') {
+    const refDir = refEdgeDirection(edges, coords, meta.angleTo.ref);
     if (!refDir || !n) return null;
-    const rad = deg * Math.PI / 180;
-    const dir = norm(rotateAroundAxis(refDir, n, rad));
-    if (fromNodeId === edge.b) return mul(dir, -1);
+    const rad = (meta.angleTo.deg || 0) * Math.PI / 180;
+    let dir = norm(rotateAroundAxis(refDir, n, rad));
+
+    // Matcha tecken mot schematisk hint
+    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Kantsida
+    if (fromNodeId === edge.b) dir = mul(dir, -1);
     return dir;
   }
 
-  if (hasPerp) {
-    const refId = meta.perpTo.ref;
-    const refDir = refEdgeDirection(edges, coords, refId);
+  // 2) perpTo (90° i planet: n × refDir)
+  if (meta.perpTo && typeof meta.perpTo.ref === 'string') {
+    const refDir = refEdgeDirection(edges, coords, meta.perpTo.ref);
     if (!refDir || !n) return null;
-    // I planet med normal n: en vektor v ⟂ refDir är cross(n, refDir)
+
     let dir = cross(n, refDir);
     if (nearZero(len(dir))) return null;
     dir = norm(dir);
+
+    // Matcha tecken mot schematisk hint (så vi får rätt "håll")
+    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Kantsida
     if (fromNodeId === edge.b) dir = mul(dir, -1);
     return dir;
   }
 
-  if (hasParallel) {
-    const refId = meta.parallelTo.ref;
-    const refDir = refEdgeDirection(edges, coords, refId);
+  // 3) parallelTo (kopiera riktning från referenskant)
+  if (meta.parallelTo && typeof meta.parallelTo.ref === 'string') {
+    const refDir = refEdgeDirection(edges, coords, meta.parallelTo.ref);
     if (!refDir) return null;
+
     let dir = refDir;
+    // Matcha tecken mot schematisk hint
+    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Kantsida
     if (fromNodeId === edge.b) dir = mul(dir, -1);
     return dir;
   }
 
-  // Inga constraints vi kan använda
+  // 4) Inga användbara constraints
   return null;
 }
 
@@ -278,17 +306,22 @@ export function calculateMetricData(graph){
 
   // Anchor vid origo
   const anchor = [...nodes.values()].find(n => n?.meta?.isAnchor);
-  if (!anchor) return null;
+  if (!anchor) {
+    console.warn('[Calc] No anchor found.');
+    return null;
+  }
 
   const coords = new Map();
   coords.set(anchor.id, v(0,0,0));
 
-  // Kör i pass tills inga framsteg
   let progress = true;
+  let pass = 0;
   while (progress) {
+    pass++;
     progress = false;
+    console.group(`[Calc] Pass ${pass}`);
 
-    // 1) Försök placera via DIREKT RIKTNING (constraints)
+    // 1) Propagera via DIREKT RIKTNING
     for (const e of edges.values()) {
       if (!hasDim(e)) continue;
       const aPlaced = coords.has(e.a);
@@ -300,30 +333,50 @@ export function calculateMetricData(graph){
       const toId   = aPlaced ? e.b : e.a;
 
       const dir = edgeDirectionFromConstraints(graph, edges, coords, fromId, e);
-      if (!dir) continue; // ingen riktning än
+      if (!dir) {
+        console.warn('[Calc] Edge', e.id, 'from', fromId, 'to', toId,
+          '→ no direction (meta:', e.meta, ')');
+        continue;
+      }
 
       const fromPos = coords.get(fromId);
       if (!fromPos) continue;
 
       const pos = add(fromPos, mul(dir, e.dim.valueMm));
       coords.set(toId, pos);
+      console.log('[Calc] Placed node', toId, 'via edge', e.id, 'at', pos);
       progress = true;
     }
 
-    // 2) Försök placera via TRIANGULERING där det behövs
+    // 2) Försök placera via TRIANGULERING
     for (const nId of nodes.keys()) {
-      if (coords.has(nId)) continue; // redan placerad
+      if (coords.has(nId)) continue;
 
       const pos = triangulateNodeInPlane(graph, edges, coords, nId);
-      if (!pos) continue;
+      if (!pos) {
+        console.warn('[Calc] Triangulation failed for node', nId);
+        continue;
+      }
 
       coords.set(nId, pos);
+      console.log('[Calc] Placed node', nId, 'via triangulation at', pos);
       progress = true;
     }
+
+    console.groupEnd();
   }
 
-  // Alla noder måste vara placerade för att vi ska returnera metriken
-  if (coords.size !== nodes.size) return null;
+  // Slutkontroll
+  if (coords.size !== nodes.size) {
+    console.warn('[Calc] Incomplete metric graph:', coords.size, '/', nodes.size, 'nodes placed');
+    for (const [id, n] of nodes) {
+      if (!coords.has(id)) {
+        console.warn('   Unplaced node:', id, 'meta:', n.meta);
+      }
+    }
+    return null;
+  }
 
+  console.info('[Calc] Completed metric placement for all nodes.');
   return coords;
 }

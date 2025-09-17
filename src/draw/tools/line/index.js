@@ -14,6 +14,9 @@ let camera, overlay, snapper,
     COLORS, addVertexSphere, setCurrentSpec,
     toGraphSpace, isAlignmentActive, toViewDir;
 
+//debug trace
+let onLineCommitted = null;
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Init
 // ──────────────────────────────────────────────────────────────────────────────
@@ -40,6 +43,9 @@ export function init(ctx){
   toGraphSpace = ctx.toGraphSpace || ((v) => v);
   isAlignmentActive = ctx.isAlignmentActive || (() => false);
   toViewDir = ctx.toViewDir || ((d) => d);
+  
+  //debug trace
+  onLineCommitted = ctx.onLineCommitted || null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -221,9 +227,10 @@ export function predictEndPoint() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-/** Commit: rita linje. Om startpunkten ligger på en center-edge → splitta först. */
+/** Commit: rita linje. Om startpunkten ligger på en befintlig kant → splitta först. */
 // ──────────────────────────────────────────────────────────────────────────────
 export function commitIfAny() {
+
   const { end3D, worldLen } = predictEndPoint();
   if (worldLen <= 1e-6) return;
 
@@ -245,13 +252,82 @@ export function commitIfAny() {
   const { node: bNode } = graph.getOrCreateNodeAt(bG);
   const edge = graph.addEdge(aNode.id, bNode.id, kind);
 
+  if (edge ) {
+    // Hämta existerande center-edges vid aNode resp. bNode (exkl. den nyss skapade)
+    const incAtA = graph.incidentEdges(aNode.id).filter(e => e.id !== edge.id);
+    const incAtB = graph.incidentEdges(bNode.id).filter(e => e.id !== edge.id);
+    const refEdge = incAtA[0] || incAtB[0];
+    const junctionNodeId = incAtA[0] ? aNode.id : (incAtB[0] ? bNode.id : null);
+
+    if (refEdge && junctionNodeId) {
+      const pJ = graph.getNodeWorldPos(junctionNodeId);
+      const pRefOther = graph.getNodeWorldPos(refEdge.a === junctionNodeId ? refEdge.b : refEdge.a);
+      const pNewOther = graph.getNodeWorldPos(edge.a === junctionNodeId ? edge.b : edge.a);
+      if (pJ && pRefOther && pNewOther) {
+        // Riktningar utåt från knutpunkten (korrekt orientering)
+        const refDir = new THREE.Vector3(
+          pRefOther.x - pJ.x, pRefOther.y - pJ.y, pRefOther.z - pJ.z
+        ).normalize();
+        const newDir = new THREE.Vector3(
+          pNewOther.x - pJ.x, pNewOther.y - pJ.y, pNewOther.z - pJ.z
+        ).normalize();
+
+        const dot = THREE.MathUtils.clamp(refDir.dot(newDir), -1, 1);
+        const angleDeg = THREE.MathUtils.radToDeg(Math.acos(dot));
+
+        // Plan-normal = planet du faktiskt ritade i
+        const normal = new THREE.Vector3().crossVectors(refDir, newDir).normalize();
+
+        const ANG_EPS = 0.5; // grader
+        const meta = {};
+        if (Math.abs(angleDeg) <= ANG_EPS) {
+          meta.parallelTo = { ref: refEdge.id };
+        } else if (Math.abs(angleDeg - 90) <= ANG_EPS) {
+          meta.perpTo = { ref: refEdge.id };
+        } else {
+          meta.angleTo = { ref: refEdge.id, deg: +angleDeg.toFixed(3) };
+        }
+        if (normal.lengthSq() > 1e-6) {
+          meta.coplanarWith = { type: 'byNormal', n: { x: normal.x, y: normal.y, z: normal.z } };
+        }
+
+        graph.setEdgeMeta(edge.id, meta);
+        console.info(`[GraphMeta] set ${edge.id} =`, meta);
+      }
+    }
+  }
+
+
   // 1.1) Spec för center-edges
   if (edge && kind === 'center' && typeof graph.setEdgeSpec === 'function') {
     const spec = getSpecById(state.spec.current);
     if (spec) graph.setEdgeSpec(edge.id, spec);
   }
 
-  // 1.2) Klassning + stress + overlays (endast center)
+  // 1.2) 🔹 Första anchor + axisLock på första center-kanten
+  if (edge) {
+    const anyAnchor = [...graph.allNodes().values()].some(n => n?.meta?.isAnchor);
+    if (!anyAnchor) {
+      // Sätt aNode som anchor
+      aNode.meta = aNode.meta || {};
+      aNode.meta.isAnchor = true;
+
+      // Sätt axisLock på denna första center-kant baserat på dess globala riktning
+      const pa = graph.getNodeWorldPos(edge.a);
+      const pb = graph.getNodeWorldPos(edge.b);
+      if (pa && pb) {
+        const dx = pb.x - pa.x, dy = pb.y - pa.y, dz = pb.z - pa.z;
+        const axAbs = { X: Math.abs(dx), Y: Math.abs(dy), Z: Math.abs(dz) };
+        let axis = 'X';
+        if (axAbs.Y >= axAbs.X && axAbs.Y >= axAbs.Z) axis = 'Y';
+        else if (axAbs.Z >= axAbs.X && axAbs.Z >= axAbs.Y) axis = 'Z';
+        graph.setEdgeMeta(edge.id, { axisLock: axis });
+        console.info(`[Graph] Första anchor: ${aNode.id}, axisLock på ${edge.id} = ${axis}`);
+      }
+    }
+  }
+
+  // 1.3) Klassning + stress + overlays (endast center)
   if (edge && kind === 'center' && typeof graph.classifyAndStoreMany === 'function') {
     const near = new Set([aNode.id, bNode.id]);
     for (const nid of [...near]) {
@@ -285,11 +361,15 @@ export function commitIfAny() {
   addVertexSphere(aG, aNode.id, COLORS.vertex);
   addVertexSphere(bG, bNode.id, COLORS.vertex);
 
+  //debug trace
+  if (typeof onLineCommitted === 'function' && edge) {
+    onLineCommitted({ edgeId: edge.id, aNodeId: aNode.id, bNodeId: bNode.id });
+  }
+
   // 4) fortsätt rita från VISNINGS-punkten (inte aG/bG)
   state.draw.lineStartPoint.copy(bView);
   overlay.recenterCursorToStart();
 }
-
 // ──────────────────────────────────────────────────────────────────────────────
 // Tangentbindningar (ritläge)
 // ──────────────────────────────────────────────────────────────────────────────
