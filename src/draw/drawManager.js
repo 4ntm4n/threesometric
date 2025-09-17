@@ -21,15 +21,17 @@ import { createTopoOverlay } from '../debug/topoOverlay.js';
 import { createJointOverlay } from '../debug/jointOverlay.js';
 
 import { nodeWorldPos } from '../graph/coords.js';
-
 import { isOnScreenPx } from '../core/camera.js';
 
-//modelrotation
+// modelrotation
 import * as alignment from '../view/alignment.js';
 
+// stateManager & calculator
+import { isGraphSolvable, checkGraphSolvable } from '../calculation/stateManager.js';
+import { calculateMetricData } from '../calculation/calculator.js';
 
-
-
+//Trace logg
+import { createGraphTracer } from '../debug/graphTrace.js';
 
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
@@ -39,11 +41,99 @@ export function createDrawManager({
 
   if (state.draw.isConstruction == null) state.draw.isConstruction = false;
 
+  //debug tracer
+  const tracer = createGraphTracer(graph, { label: 'GraphTrace' });
+
   // Mappar för att kunna uppdatera 3D efter slope-commit
   const edgeIdToLine = new Map(); // endast center-edges
   const nodeIdToSphere = new Map();
 
+  // ────────────────────────────────────────────────────────────
+  // Frame-root vi kan rotera som en enhet (allt visuellt under här)
+  // ────────────────────────────────────────────────────────────
+  const frameRoot = new THREE.Group();
+  scene.add(frameRoot);
 
+  function safeReparent(obj){ if (!obj) return; if (obj.parent) obj.parent.remove(obj); frameRoot.add(obj); }
+  safeReparent(modelGroup);
+  safeReparent(permanentVertices);
+  safeReparent(picker.pickables);
+
+  // Idle-markör (vit) – ska också ligga under frameRoot
+  const idleMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.2, 16, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffffff })
+  );
+  idleMarker.renderOrder = 2;
+  frameRoot.add(idleMarker);
+  function setIdleMarkerColor(hex) { idleMarker.material.color.setHex(hex); }
+
+  // knyt frameRoot under alignGroup
+  alignment.attach(scene, frameRoot);
+
+  // 3D-grid som roterar med modellen (XZ-grid t.ex.)
+  const helperGrid = new THREE.GridHelper(200, 40, 0x2a9d8f, 0x264653);
+  helperGrid.material.opacity = 0.25;
+  helperGrid.material.transparent = true;
+  helperGrid.visible = false;
+  frameRoot.add(helperGrid);
+
+  function enableAlignedGrid(on){
+    helperGrid.visible = !!on;
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Metric View Group (under frameRoot så den följer alignment)
+  // ────────────────────────────────────────────────────────────
+  const metricViewGroup = new THREE.Group();
+  metricViewGroup.name = 'metricViewGroup';
+  metricViewGroup.visible = false; // börjar av
+  frameRoot.add(metricViewGroup);
+
+  // mm→world-skala: välj faktor så metrisk modell blir rimlig i scenen
+  const MM_TO_WORLD = 0.08; // 1 mm = 0.08 world-units (justera efter behov)
+
+  // snabba helpers
+  function disposeGroupChildren(group) {
+    while (group.children.length) {
+      const obj = group.children.pop();
+      if (obj.geometry) obj.geometry.dispose?.();
+      if (obj.material) obj.material.dispose?.();
+      group.remove(obj);
+    }
+  }
+
+  function buildMetricLinesFrom(graph, coords) {
+    disposeGroupChildren(metricViewGroup);
+
+    // Material (enkelt: center vs construction)
+    const matCenter = new THREE.LineBasicMaterial({ linewidth: 1 });
+    const matConstr = new THREE.LineDashedMaterial({ linewidth: 1, dashSize: 0.05, gapSize: 0.03 });
+
+    for (const e of graph.allEdges().values()) {
+      const a = coords.get(e.a), b = coords.get(e.b);
+      if (!a || !b) continue;
+
+      const g = new THREE.BufferGeometry();
+      const ax = a.x * MM_TO_WORLD, ay = a.y * MM_TO_WORLD, az = a.z * MM_TO_WORLD;
+      const bx = b.x * MM_TO_WORLD, by = b.y * MM_TO_WORLD, bz = b.z * MM_TO_WORLD;
+      const pos = new Float32Array([ax, ay, az, bx, by, bz]);
+      g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+
+      let line;
+      if (e.kind === 'construction') {
+        line = new THREE.Line(g, matConstr);
+        line.computeLineDistances?.();
+      } else {
+        line = new THREE.Line(g, matCenter);
+      }
+      metricViewGroup.add(line);
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────
+  // Overlays
+  // ────────────────────────────────────────────────────────────
   const topoOverlay = createTopoOverlay({
     graph,
     nodeIdToSphere,
@@ -53,50 +143,15 @@ export function createDrawManager({
   });
   const jointOverlay = createJointOverlay({ scene, graph });
 
-  // Idle-markör (vit)
-  const idleMarker = new THREE.Mesh(
-    new THREE.SphereGeometry(0.2, 16, 8),
-    new THREE.MeshBasicMaterial({ color: 0xffffff })
-  );
-  idleMarker.renderOrder = 2;
-  scene.add(idleMarker);
-
-  function setIdleMarkerColor(hex) { idleMarker.material.color.setHex(hex); }
-
-  // Frame-root vi kan rotera som en enhet
-  const frameRoot = new THREE.Group();
-scene.add(frameRoot);
-function safeReparent(obj){ if (!obj) return; if (obj.parent) obj.parent.remove(obj); frameRoot.add(obj); }
-safeReparent(modelGroup);
-safeReparent(permanentVertices);
-safeReparent(picker.pickables);
-safeReparent(idleMarker);
-
-// knyt frameRoot under alignGroup
-alignment.attach(scene, frameRoot);
-
-// 3D-grid som roterar med modellen (XZ-grid t.ex.)
-const helperGrid = new THREE.GridHelper(200, 40, 0x2a9d8f, 0x264653);
-helperGrid.material.opacity = 0.25;
-helperGrid.material.transparent = true;
-helperGrid.visible = false;
-frameRoot.add(helperGrid);
-
-// små hjälpare
-function enableAlignedGrid(on){
-  helperGrid.visible = !!on;
-  // vill du samtidigt dölja 2D-overlay-grid:
-  // overlay.setGridVisible && overlay.setGridVisible(!on);
-}
-
-
-  // ── Initiera verktyg/moder
+  // ────────────────────────────────────────────────────────────
+  // Initiera verktyg/moder
+  // ────────────────────────────────────────────────────────────
   slopeTool.init({
     scene, graph, picker, snapper, nodeWorldPos,
     edgeIdToLine, nodeIdToSphere, topoOverlay, jointOverlay,
     setIdleMarkerColor, COLORS, idleMarker
   });
-  
+
   lineTool.init({
     camera, overlay, snapper,
     graph, modelGroup, picker,
@@ -106,9 +161,13 @@ function enableAlignedGrid(on){
     setCurrentSpec,
     toGraphSpace: alignment.toGraphSpace,
     isAlignmentActive: alignment.isActive,
-    
+
     splitEdgeAt: (edgeId, hitWorldPos, opts = {}) =>
-    splitTool.splitEdge(graph, edgeId, { hitWorldPos, ...opts }),
+      splitTool.splitEdge(graph, edgeId, { hitWorldPos, ...opts }),
+   
+    onLineCommitted: ({ edgeId, aNodeId, bNodeId }) => {
+    tracer.snapshot(`after line commit (edge ${edgeId})`);
+  }
   });
 
   inspect.init({
@@ -129,7 +188,6 @@ function enableAlignedGrid(on){
   });
 
   dimTool.init({ camera, overlay, graph, edgeIdToLine });
-
 
   const {
     slope,
@@ -160,7 +218,6 @@ function enableAlignedGrid(on){
   // Public API
   function getStartPoint() { return state.draw.lineStartPoint; }
 
-
   function setCurrentSpec(id, { announce = true } = {}) {
     const spec = getSpecById(id);
     if (!spec) return false;
@@ -169,7 +226,9 @@ function enableAlignedGrid(on){
     return true;
   }
 
+  // ────────────────────────────────────────────────────────────
   // Pointer events
+  // ────────────────────────────────────────────────────────────
   function onMouseMove(e, pickPlaneMesh) {
     if (alignment.isAnimating?.()) return;
     if (document.pointerLockElement) {
@@ -182,14 +241,13 @@ function enableAlignedGrid(on){
       return; // inget hover i draw-läge
     }
 
-    
     if (slope.active) {
       return slopeTool.handleHover(e); // orange hover i slope-läge
-      }
-      if (dimTool.isActive()) {
-        return dimTool.handleHover(e);
-      }
-      return inspect.handleHover(e, pickPlaneMesh); // grön hover i inspektionsläge
+    }
+    if (dimTool.isActive()) {
+      return dimTool.handleHover(e);
+    }
+    return inspect.handleHover(e, pickPlaneMesh); // grön hover i inspektionsläge
   }
 
   function onPointerDown(e, pickPlaneMesh) {
@@ -201,7 +259,7 @@ function enableAlignedGrid(on){
     if (slope.active && !document.pointerLockElement) {
       return slopeTool.onPointerDown(e);
     }
-    
+
     if (!document.pointerLockElement && dimTool.isActive()) {
       return dimTool.onPointerDown(e);
     }
@@ -274,7 +332,6 @@ function enableAlignedGrid(on){
       return;
     }
 
-
     // Toggle konstruktionsläge i ritläge
     if (e.code === 'KeyG' && document.pointerLockElement) {
       state.draw.isConstruction = !state.draw.isConstruction;
@@ -311,8 +368,6 @@ function enableAlignedGrid(on){
         state.draw.pending = false;
       }
     }
-
-    
   }
 
   function onResize(camera, renderer3D) {
@@ -327,6 +382,51 @@ function enableAlignedGrid(on){
     if (state.draw.isDrawing && state.draw.hasStart) overlay.recomputeStart2D(state.draw.lineStartPoint);
   }
 
+  // ────────────────────────────────────────────────────────────
+  // Metric View
+  // ────────────────────────────────────────────────────────────
+  let metricRequested = false;
+
+  async function updateMetricView() {
+    const diag = checkGraphSolvable(graph);
+    if (!diag.ok) return false;
+    const coords = calculateMetricData(graph);
+    if (!coords) return false;
+    buildMetricLinesFrom(graph, coords);
+    await resetIsoAndFitAll({ scene, modelGroup: metricViewGroup, controls, camera });
+    return true;
+  }
+
+  function toggleMetricView(visible) {
+    metricRequested = !!visible; // <- viktig skillnad
+    if (!metricRequested) {
+      metricViewGroup.visible = false;
+      modelGroup.visible = true;
+      return;
+    }
+    // försök direkt
+    updateMetricView().then(ok => {
+      metricViewGroup.visible = ok;
+      modelGroup.visible = !ok;
+    });
+  }
+
+  // Försök på varje måttändring när användaren har begärt metrisk vy
+  graph.onEdgeDimensionChanged?.((eid) => {
+    tracer.snapshot(`after setEdgeDimension (edge ${eid})`);
+    if (!metricRequested) return;
+    updateMetricView().then(ok => {
+      metricViewGroup.visible = ok;
+      modelGroup.visible = !ok;
+    });
+  });
+
+
+
+
+  // ────────────────────────────────────────────────────────────
+  // Public API
+  // ────────────────────────────────────────────────────────────
   return {
     getStartPoint,
     onMouseMove,
@@ -334,6 +434,10 @@ function enableAlignedGrid(on){
     onKeyDown,
     onKeyUp,
     onPointerLockChange,
-    onResize
+    onResize,
+    // MetricView relaterat
+    updateMetricView,
+    toggleMetricView,
+    getMetricGroup: () => metricViewGroup,
   };
 }

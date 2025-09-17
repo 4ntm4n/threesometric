@@ -1,0 +1,22 @@
+name: Contract Tests
+
+on:
+  push:
+    branches: [ main, cleanup, calculator ]
+  pull_request:
+    branches: [ main, cleanup, calculator ]
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install (no deps needed, but keep step)
+        run: npm ci --ignore-scripts || true
+      - name: Run contract tests
+        run: npm run test:contract
