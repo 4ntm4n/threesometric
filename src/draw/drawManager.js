@@ -30,8 +30,22 @@ import * as alignment from '../view/alignment.js';
 import { isGraphSolvable, checkGraphSolvable } from '../calculation/stateManager.js';
 import { calculateMetricData } from '../calculation/calculator.js';
 
+
+// sätt ut derived mått 
+import { setMetricData as setDimToolMetricData } from '../measure/dimensionTool.js';
+
+
 //Trace logg
 import { createGraphTracer } from '../debug/graphTrace.js';
+
+
+function debounce(fn, ms = 80) {
+  let t;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
 
 export function createDrawManager({
   scene, camera, renderer3D, controls, overlay, picker, snapper, modelGroup, permanentVertices, graph
@@ -94,6 +108,30 @@ export function createDrawManager({
   const MM_TO_WORLD = 0.08; // 1 mm = 0.08 world-units (justera efter behov)
 
   // snabba helpers
+  
+ // Backfill: se till att alla construction-kanter har axisLock (X/Y/Z)
+  function ensureConstructionAxisLocks() {
+    const edges = graph.allEdges?.();
+    if (!edges) return;
+    for (const e of edges.values()) {
+      if (!e || e.kind !== 'construction') continue;
+      const meta = graph.getEdgeMeta?.(e.id) || {};
+      if (meta.axisLock) continue;
+
+      const pa = graph.getNodeWorldPos?.(e.a);
+      const pb = graph.getNodeWorldPos?.(e.b);
+      if (!pa || !pb) continue;
+
+      const dx = pb.x - pa.x, dy = pb.y - pa.y, dz = pb.z - pa.z;
+      let axis = 'X';
+      if (Math.abs(dy) >= Math.abs(dx) && Math.abs(dy) >= Math.abs(dz)) axis = 'Y';
+      else if (Math.abs(dz) >= Math.abs(dx) && Math.abs(dz) >= Math.abs(dy)) axis = 'Z';
+
+      graph.setEdgeMeta(e.id, { ...meta, axisLock: axis });
+      console.info(`[AutoMeta:backfill] ${e.id} axisLock=${axis}`);
+    }
+  }
+
   function disposeGroupChildren(group) {
     while (group.children.length) {
       const obj = group.children.pop();
@@ -169,6 +207,12 @@ export function createDrawManager({
     tracer.snapshot(`after line commit (edge ${edgeId})`);
   }
   });
+
+  try {
+  ensureConstructionAxisLocks();
+  const coords = calculateMetricData(graph, { quiet: true, force: true });
+  if (coords) setDimToolMetricData(coords);
+} catch {}
 
   inspect.init({
     camera, renderer3D, overlay, picker, snapper, graph, controls,
@@ -392,6 +436,10 @@ export function createDrawManager({
     if (!diag.ok) return false;
     const coords = calculateMetricData(graph);
     if (!coords) return false;
+
+    // 👇 NYTT: ge dimensionTool info om derived längder
+    setDimToolMetricData(coords);
+
     buildMetricLinesFrom(graph, coords);
     await resetIsoAndFitAll({ scene, modelGroup: metricViewGroup, controls, camera });
     return true;
@@ -411,16 +459,36 @@ export function createDrawManager({
     });
   }
 
+  // Debouncad "tyst" kalkyl som bara kör när ritningen är fully constrained
+  const runSilentRecalcIfReady = debounce(() => {
+    const diag = checkGraphSolvable(graph);
+    if (diag.ok && diag.isFullyConstrained) {
+      const coords = calculateMetricData(graph, { quiet: true });
+      if (coords) {
+        // ge dimensionTool derived-längder för schematisk overlay
+        setDimToolMetricData(coords);
+      }
+    }
+  }, 60);
+
   // Försök på varje måttändring när användaren har begärt metrisk vy
   graph.onEdgeDimensionChanged?.((eid) => {
-    tracer.snapshot(`after setEdgeDimension (edge ${eid})`);
-    if (!metricRequested) return;
+  tracer.snapshot(`after setEdgeDimension (edge ${eid})`);
+
+  ensureConstructionAxisLocks(); // som du har
+
+  // 🟦 Tyst kalkyl för schematisk overlay — kör alltid, med force:true
+  const coords = calculateMetricData(graph, { quiet: true, force: true });
+  if (coords) setDimToolMetricData(coords);
+
+  // F9-metrisk vy får gärna fortsätta kräva solvbarhet:
+  if (metricRequested) {
     updateMetricView().then(ok => {
       metricViewGroup.visible = ok;
       modelGroup.visible = !ok;
     });
-  });
-
+  }
+});
 
 
 

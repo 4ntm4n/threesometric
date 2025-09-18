@@ -16,6 +16,16 @@ export function createOverlay2D() {
   let _graphRef = null;
   function attachGraph(graph){ _graphRef = graph; }
 
+  // (NYTT) Dimension-provider (från dimensionTool): { getEdgeLabelInfo(edgeId) -> { valueMm, isDerived, aWorld, bWorld, ... } }
+  let _dimensionProvider = null;
+  function setDimensionProvider(provider) { _dimensionProvider = provider || null; }
+
+  // (NYTT) Enkel refresh-hook om något utanför vill trigga omläggning (valfritt)
+  function refresh() {
+    // Ingen intern renderloop här; draw() kallas av yttre kod (drawManager).
+    // Denna finns bara för API-symmetri och ev. framtida bruk.
+  }
+
   const virtualCursorEl = document.getElementById('virtual-cursor') || (() => {
     const el = document.createElement('div');
     el.id = 'virtual-cursor';
@@ -75,12 +85,12 @@ export function createOverlay2D() {
     const L = Math.hypot(t.x, t.y) || 1; t.x/=L; t.y/=L;
     const n = { x: -t.y, y: t.x }; // vänster normal
 
-    // Offset från objektet i pixlar (kan framtida kopplas till pixelsPerWorldUnit om man vill)
+    // Offset från objektet i pixlar
     const offset = 14;
     const pA2 = { x: pA.x + n.x*offset, y: pA.y + n.y*offset };
     const pB2 = { x: pB.x + n.x*offset, y: pB.y + n.y*offset };
 
-    // Projektera ändpunkter på dimensionens riktning (för axis*). Aligned använder förskjutna AB direkt.
+    // Projektion för axis*-lägen
     function proj(p, origin, dir){
       const vx = p.x - origin.x, vy = p.y - origin.y;
       const s = vx*dir.x + vy*dir.y;
@@ -97,7 +107,6 @@ export function createOverlay2D() {
     ctx.setLineDash(hasConflict ? [2,3] : []);
     ctx.lineWidth = hasConflict ? 2 : 1;
     ctx.strokeStyle = hasConflict ? '#ff6b6b' : (isDerived ? '#9ecbff' : '#ffffff');
-
 
     // Förlängningslinjer
     ctx.beginPath();
@@ -122,7 +131,8 @@ export function createOverlay2D() {
     ctx.stroke();
 
     // Text
-    const txt = `${Number(valueMm).toFixed(2)} mm`;    const midDim = { x: (qA.x + qB.x)/2, y: (qA.y + qB.y)/2 };
+    const txt = `${Number(valueMm).toFixed(2)} mm`;
+    const midDim = { x: (qA.x + qB.x)/2, y: (qA.y + qB.y)/2 };
     const textOff = 10;
     ctx.font = '12px ui-sans-serif, system-ui, -apple-system';
     ctx.fillStyle = hasConflict ? '#ff6b6b' : (isDerived ? '#9ecbff' : '#ffffff');
@@ -135,7 +145,34 @@ export function createOverlay2D() {
 
   function drawDimensions(){
     if (!_graphRef) return;
-    // Rita dimensioner för alla center-kanter som har dim-metadata
+
+    // (NYTT) Om det finns en dimension-provider (från dimensionTool), använd den
+    if (_dimensionProvider?.getEdgeLabelInfo) {
+      for (const [eid, e] of _graphRef.allEdges()) {
+        if (!e || (e.kind !== 'center' && e.kind !== 'construction')) continue;
+
+        // Be providern om info (user eller derived). Får vi null → ingen linje.
+        const info = _dimensionProvider.getEdgeLabelInfo(eid);
+        if (!info) continue;
+
+        try {
+          // Vi använder vår standard-renderare men talar om att källan är derived/user via .source
+          const a3 = info.aWorld;
+          const b3 = info.bWorld;
+          const dim = {
+            valueMm: info.valueMm,
+            mode: 'aligned',                 // samma stil som befintliga
+            source: info.isDerived ? 'derived' : 'user'
+          };
+          drawEdgeDimension2D(a3, b3, dim);
+        } catch {
+          /* säkert att ignorera enskilda fel vid ritning */
+        }
+      }
+      return; // klart med provider-vägen
+    }
+
+    // — Fallback (befintligt beteende): rita bara user-dimensioner från edge.dim —
     for (const [eid, e] of _graphRef.allEdges()) {
       if (!e || (e.kind !== 'center' && e.kind !== 'construction') || !e.dim || typeof e.dim.valueMm !== 'number') continue;
       try {
@@ -149,7 +186,10 @@ export function createOverlay2D() {
   return {
     canvas,
     ctx,
-    attachGraph, // <— exponera så main kan koppla grafen
+    attachGraph,              // <— kopplas från main/drawManager
+    setDimensionProvider,     // <— NYTT: dimensionTool kan injicera provider
+    refresh,                  // <— NYTT: frivillig redraw-trigger
+
     get start2D() { return start2D; },
     get virtualCursorPix() { return virtualCursorPix; },
 

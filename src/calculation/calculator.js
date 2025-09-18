@@ -298,7 +298,8 @@ function projectPointToPlane(P, O, nUnit){
 
 // ──────────────────────────────────────────────────────────────
 // Huvudfunktion
-export function calculateMetricData(graph){
+export function calculateMetricData(graph, opts = {}) {
+  const quiet = !!opts.quiet;
   if (!isGraphSolvable(graph)) return null;
 
   const nodes = graph.allNodes();
@@ -307,7 +308,9 @@ export function calculateMetricData(graph){
   // Anchor vid origo
   const anchor = [...nodes.values()].find(n => n?.meta?.isAnchor);
   if (!anchor) {
-    console.warn('[Calc] No anchor found.');
+    quiet
+      ? console.debug('[Calc] No anchor found.')
+      : console.warn('[Calc] No anchor found.');
     return null;
   }
 
@@ -319,7 +322,9 @@ export function calculateMetricData(graph){
   while (progress) {
     pass++;
     progress = false;
-    console.group(`[Calc] Pass ${pass}`);
+
+    if (!quiet) console.group(`[Calc] Pass ${pass}`);
+    else console.debug(`[Calc] Pass ${pass}`);
 
     // 1) Propagera via DIREKT RIKTNING
     for (const e of edges.values()) {
@@ -334,8 +339,11 @@ export function calculateMetricData(graph){
 
       const dir = edgeDirectionFromConstraints(graph, edges, coords, fromId, e);
       if (!dir) {
-        console.warn('[Calc] Edge', e.id, 'from', fromId, 'to', toId,
-          '→ no direction (meta:', e.meta, ')');
+        quiet
+          ? console.debug('[Calc] Edge', e.id, 'from', fromId, 'to', toId,
+              '→ no direction (meta:', e.meta, ')')
+          : console.warn('[Calc] Edge', e.id, 'from', fromId, 'to', toId,
+              '→ no direction (meta:', e.meta, ')');
         continue;
       }
 
@@ -344,9 +352,80 @@ export function calculateMetricData(graph){
 
       const pos = add(fromPos, mul(dir, e.dim.valueMm));
       coords.set(toId, pos);
-      console.log('[Calc] Placed node', toId, 'via edge', e.id, 'at', pos);
+      quiet
+        ? console.debug('[Calc] Placed node', toId, 'via edge', e.id, 'at', pos)
+        : console.log('[Calc] Placed node', toId, 'via edge', e.id, 'at', pos);
       progress = true;
     }
+
+    // 1.5) Placera noder som ligger "på segment" (onSegment) med känt avstånd till A eller B
+   for (const [nid, n] of nodes) {
+     if (coords.has(nid)) continue;
+     const seg = n?.meta?.onSegment;
+     if (!seg) continue;
+     const A = coords.get(seg.a);
+     const B = coords.get(seg.b);
+     if (!A || !B) continue; // vänta tills segmentets ändar är placerade
+
+     // Hitta känt avstånd till A eller B via incident kant
+     const inc = incidentEdgesOf(graph, nid);
+     let L = null, from = null;
+     for (const e of inc) {
+       if (!hasDim(e)) continue;
+       if ((e.a === nid && e.b === seg.a) || (e.b === nid && e.a === seg.a)) { L = e.dim.valueMm; from = 'A'; break; }
+       if ((e.a === nid && e.b === seg.b) || (e.b === nid && e.a === seg.b)) { L = e.dim.valueMm; from = 'B'; break; }
+     }
+     if (L == null) continue;
+
+     // N = A + normalize(B-A) * L (eller från B)
+     const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+     const distAB = Math.hypot(dx, dy, dz) || 1;
+     const ux = dx / distAB, uy = dy / distAB, uz = dz / distAB;
+     const pos = (from === 'A')
+       ? { x: A.x + ux * L, y: A.y + uy * L, z: A.z + uz * L }
+       : { x: B.x - ux * L, y: B.y - uy * L, z: B.z - uz * L };
+
+     coords.set(nid, pos);
+     if (!quiet) console.log('[Calc] Placed node', nid, 'onSegment', seg, 'at', pos);
+     progress = true;
+   }
+
+
+   // 1.6) Placera "straight"-noder mellan två placerade grannar via delmått
+  for (const [nid, n] of nodes) {
+    if (coords.has(nid)) continue;
+    const topo = n?.meta?.topo;
+    if (topo !== 'straight') continue;
+
+    // Hämta center-incidenta kanter
+    const incCenter = incidentEdgesOf(graph, nid).filter(e => e?.kind === 'center');
+    if (incCenter.length !== 2) continue; // "straight" bör ha två center-grannar
+
+    const eA = incCenter[0], eB = incCenter[1];
+    const A = coords.get(eA.a === nid ? eA.b : eA.a);
+    const B = coords.get(eB.a === nid ? eB.b : eB.a);
+    if (!A || !B) continue; // vänta tills båda ändar i linjen är placerade
+
+    // Finns känt delmått till A eller B?
+    let L = null, from = null;
+    if (hasDim(eA)) { L = eA.dim.valueMm; from = 'A'; }
+    if (hasDim(eB)) { L = eB.dim.valueMm; from = from ? from : 'B'; } // om båda finns, ta första
+
+    if (L == null) continue;
+
+    // Placera n på linjen A→B respektive B→A
+    const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+    const lenAB = Math.hypot(dx, dy, dz) || 1;
+    const ux = dx / lenAB, uy = dy / lenAB, uz = dz / lenAB;
+
+    const pos = (from === 'A')
+      ? { x: A.x + ux * L, y: A.y + uy * L, z: A.z + uz * L }
+      : { x: B.x - ux * L, y: B.y - uy * L, z: B.z - uz * L };
+
+    coords.set(nid, pos);
+    if (!quiet) console.log('[Calc] Placed node', nid, 'as straight-on-segment between neighbors at', pos);
+    progress = true;
+}
 
     // 2) Försök placera via TRIANGULERING
     for (const nId of nodes.keys()) {
@@ -354,29 +433,61 @@ export function calculateMetricData(graph){
 
       const pos = triangulateNodeInPlane(graph, edges, coords, nId);
       if (!pos) {
-        console.warn('[Calc] Triangulation failed for node', nId);
+        quiet
+          ? console.debug('[Calc] Triangulation failed for node', nId)
+          : console.warn('[Calc] Triangulation failed for node', nId);
         continue;
       }
 
       coords.set(nId, pos);
-      console.log('[Calc] Placed node', nId, 'via triangulation at', pos);
+      quiet
+        ? console.debug('[Calc] Placed node', nId, 'via triangulation at', pos)
+        : console.log('[Calc] Placed node', nId, 'via triangulation at', pos);
       progress = true;
     }
 
-    console.groupEnd();
+    if (!quiet) console.groupEnd();
   }
 
   // Slutkontroll
   if (coords.size !== nodes.size) {
-    console.warn('[Calc] Incomplete metric graph:', coords.size, '/', nodes.size, 'nodes placed');
+    quiet
+      ? console.debug('[Calc] Incomplete metric graph:', coords.size, '/', nodes.size, 'nodes placed')
+      : console.warn('[Calc] Incomplete metric graph:', coords.size, '/', nodes.size, 'nodes placed');
     for (const [id, n] of nodes) {
       if (!coords.has(id)) {
-        console.warn('   Unplaced node:', id, 'meta:', n.meta);
+        quiet
+          ? console.debug('   Unplaced node:', id, 'meta:', n.meta)
+          : console.warn('   Unplaced node:', id, 'meta:', n.meta);
       }
     }
     return null;
   }
 
-  console.info('[Calc] Completed metric placement for all nodes.');
+  quiet
+    ? console.debug('[Calc] Completed metric placement for all nodes.')
+    : console.info('[Calc] Completed metric placement for all nodes.');
+
+  // ── NY KOD: beräkna härledda längder för kanter utan mått ──
+  const derivedEdgeLengths = new Map();
+  for (const e of graph.allEdges().values()) {
+    const hasUserDim =
+      e?.dim && typeof e.dim.valueMm === 'number' && isFinite(e.dim.valueMm) && e.dim.valueMm > 0;
+    if (hasUserDim) continue;
+
+    const A = coords.get(e.a);
+    const B = coords.get(e.b);
+    if (!A || !B) continue;
+
+    const dx = A.x - B.x, dy = A.y - B.y, dz = A.z - B.z;
+    const L = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+    derivedEdgeLengths.set(e.id, L);
+  }
+
+  // Häng på som extra egenskap (bakåtkompatibelt)
+  coords.derivedEdgeLengths = derivedEdgeLengths;
+
+  // Returnera som tidigare (Map)
   return coords;
 }

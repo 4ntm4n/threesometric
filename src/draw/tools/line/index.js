@@ -252,7 +252,7 @@ export function commitIfAny() {
   const { node: bNode } = graph.getOrCreateNodeAt(bG);
   const edge = graph.addEdge(aNode.id, bNode.id, kind);
 
-  if (edge ) {
+  if (edge && kind === 'center') {
     // Hämta existerande center-edges vid aNode resp. bNode (exkl. den nyss skapade)
     const incAtA = graph.incidentEdges(aNode.id).filter(e => e.id !== edge.id);
     const incAtB = graph.incidentEdges(bNode.id).filter(e => e.id !== edge.id);
@@ -293,6 +293,24 @@ export function commitIfAny() {
 
         graph.setEdgeMeta(edge.id, meta);
         console.info(`[GraphMeta] set ${edge.id} =`, meta);
+      }
+    }
+  }
+  // Auto-axellås för konstruktioner: X/Y/Z beroende på dominerande komponent
+  if (edge && kind === 'construction') {
+    const pa = graph.getNodeWorldPos?.(edge.a);
+    const pb = graph.getNodeWorldPos?.(edge.b);
+    if (pa && pb) {
+      const dx = pb.x - pa.x, dy = pb.y - pa.y, dz = pb.z - pa.z;
+      // välj den komponent som “vinner”
+      let axis = 'X';
+      if (Math.abs(dy) >= Math.abs(dx) && Math.abs(dy) >= Math.abs(dz)) axis = 'Y';
+      else if (Math.abs(dz) >= Math.abs(dx) && Math.abs(dz) >= Math.abs(dy)) axis = 'Z';
+
+      const prev = graph.getEdgeMeta(edge.id) || {};
+      if (!prev.axisLock) {
+        graph.setEdgeMeta(edge.id, { ...prev, axisLock: axis });
+        console.info(`[AutoMeta] construction ${edge.id} axisLock=${axis}`);
       }
     }
   }
