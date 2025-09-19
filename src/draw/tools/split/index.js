@@ -67,22 +67,71 @@ export function splitEdge(graph, edgeId, opts = {}) {
     tClamped = null; // vi kan inte beräkna t utan world-coords
   }
 
-  // 1) Skapa ny nod i grafen
-  const nNew = graph.addNodeAt(pSplit);
-  const newNodeId = nNew.id;
-  if (typeof opts.onNodeCreated === 'function') opts.onNodeCreated(newNodeId);
+  
+  // 1) Skapa eller återanvänd nod vid splitpunkten
+  const mergeEps = (typeof opts.mergeEps === 'number') ? opts.mergeEps : 1e-6;
 
-  // Markera att nya noden ligger på metriska segmentet A–B
-  try {
-    const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
-    const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
-    if (typeof graph.setNodeMeta === 'function') {
-      graph.setNodeMeta(newNodeId, nextMeta);
-    } else {
-      const n = graph.getNode?.(newNodeId);
-      if (n) n.meta = nextMeta;
+  // Om det redan finns en nod väldigt nära splitpunkten → återanvänd den
+  let existing = null;
+  if (typeof graph.findNodeNear === 'function') {
+    existing = graph.findNodeNear(pSplit, mergeEps);
+    // ignorera om "befintlig" är en av ändnoderna (det fallet hanteras tidigare via too_close_to_a/b)
+    if (existing && (existing.id === e.a || existing.id === e.b)) {
+      existing = null;
     }
-  } catch { /* ignore */ }
+  }
+
+  let newNodeId;
+  if (existing) {
+    // Återanvänd
+    newNodeId = existing.id;
+
+    // Se till att onSegment-meta finns (utan att trampa sönder befintlig meta)
+    try {
+      const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
+      if (!prevMeta.onSegment) {
+        const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
+        if (typeof graph.setNodeMeta === 'function') {
+          graph.setNodeMeta(newNodeId, nextMeta);
+        } else {
+          const n = graph.getNode?.(newNodeId);
+          if (n) n.meta = nextMeta;
+        }
+      }
+    } catch { /* ignore */ }
+
+    // Notifiera UI-krok om du vill
+    if (typeof opts.onNodeCreated === 'function') opts.onNodeCreated(newNodeId);
+  } else {
+    // Skapa ny nod
+    const nNew = graph.addNodeAt(pSplit);
+    newNodeId = nNew.id;
+    if (typeof opts.onNodeCreated === 'function') opts.onNodeCreated(newNodeId);
+
+    // Sätt onSegment-meta på den nya noden
+    try {
+      const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
+      const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
+      if (typeof graph.setNodeMeta === 'function') {
+        graph.setNodeMeta(newNodeId, nextMeta);
+      } else {
+        const n = graph.getNode?.(newNodeId);
+        if (n) n.meta = nextMeta;
+      }
+    } catch { /* ignore */ }
+  }
+
+    // Markera att nya noden ligger på metriska segmentet A–B
+    try {
+      const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
+      const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
+      if (typeof graph.setNodeMeta === 'function') {
+        graph.setNodeMeta(newNodeId, nextMeta);
+      } else {
+        const n = graph.getNode?.(newNodeId);
+        if (n) n.meta = nextMeta;
+      }
+    } catch { /* ignore */ }
 
   // Bevara ev. spec från originalkanten
   const spec = graph.getEdgeSpec?.(edgeId);

@@ -2,73 +2,127 @@
 // src/debug/metricTrace.js
 // Konsolloggning av mental graf (node.meta.metric) + kantmått runt ett edgeId.
 // ─────────────────────────────────────────────────────────────────────────────-
+function coincidentGroups(graph, nodeIds, eps = 1e-6) {
+  const groups = [];
+  for (const nid of nodeIds) {
+    const w = graph.getNodeWorldPos(nid);
+    if (!w) continue;
+    let g = groups.find(g =>
+      Math.abs(g.w.x - w.x) < eps &&
+      Math.abs(g.w.y - w.y) < eps &&
+      Math.abs(g.w.z - w.z) < eps
+    );
+    if (!g) { g = { w, ids: [] }; groups.push(g); }
+    g.ids.push(nid);
+  }
+  const map = new Map();
+  groups.forEach((g, i) => g.ids.forEach(id => map.set(id, g.ids.length > 1 ? `G${i}` : null)));
+  return map; // nid -> "G0"/"G1"/... eller null om unik
+}
+
 export function dumpComponentAroundEdge(graph, edgeId, { title = '' } = {}) {
+  // Samla topologisk komponent runt given kant
   const comp = collectComponentFromEdge(graph, edgeId);
   if (!comp.nodes.length) {
     console.group(`[TRACE] ${title} (edge ${edgeId}) – no component`);
     console.groupEnd();
     return;
   }
+
+  // Hämta metrisk lösning från kalkylatorn (tyst)
+  let metricData = null;
+  try {
+    metricData = calculateMetricData(graph, { quiet: true });
+  } catch (_) {
+    metricData = null;
+  }
+
+  // Om kalkylatorn gav något, extrahera ev. härledda längder (Map)
+  const derivedMap = metricData?.derivedEdgeLengths || null;
+
+  // — Noder: world (schematiskt) + calc (metriskt)
   const nodesTbl = [];
   for (const nid of comp.nodes) {
     const n = graph.getNode(nid);
-    const m = n?.meta?.metric || {};
-    const w = graph.getNodeWorldPos(nid) || { x:NaN, y:NaN, z:NaN };
+
+    // world (schematiskt)
+    const w = graph.getNodeWorldPos(nid) || { x: NaN, y: NaN, z: NaN };
+
+    // calc (metriskt) – hämta från kalkylatorns koordinat-Map
+    const c = metricData?.get?.(nid) || null;
+    const coincMap = coincidentGroups(graph, comp.nodes);
     nodesTbl.push({
       nid,
-      'metric.x': round(m.x), 'metric.y': round(m.y), 'metric.z': round(m.z), known: !!m.known,
-      'world.x': round(w.x),  'world.y': round(w.y),  'world.z': round(w.z),
+      // calc/metriskt
+      'calc.x': round(c?.x), 'calc.y': round(c?.y), 'calc.z': round(c?.z),
+      'calc.known': !!c, // true om placerad i metriska lösningen
+
+      // world/schematiskt
+      'world.x': round(w.x), 'world.y': round(w.y), 'world.z': round(w.z),
+
+      // ev. tidigare metric-meta (kan vara stale, men behåll för jämförelse)
+      'meta.metric.x': round(n?.meta?.metric?.x),
+      'meta.metric.y': round(n?.meta?.metric?.y),
+      'meta.metric.z': round(n?.meta?.metric?.z),
+      'meta.metric.known': !!n?.meta?.metric?.known,
+      'world.coincident': coincMap.get(nid),
     });
   }
 
+  // — Kanter: visa både dim och faktisk metrisk längd
   const edgesTbl = [];
   for (const eid of comp.edges) {
-    const e   = graph.getEdge(eid);
-    const aM  = graph.getNode(e.a)?.meta?.metric;
-    const bM  = graph.getNode(e.b)?.meta?.metric;
-    const dMm = (aM?.known && bM?.known) ? dist3(aM,bM) : NaN;
-    const dim = e.dim || {};
+    const e = graph.getEdge(eid);
+    const dim = e?.dim || {};
+
+    // Metrisk längd från kalkylatorn:
+    let metricLen = NaN;
+    if (metricData) {
+      const A = metricData.get(e.a);
+      const B = metricData.get(e.b);
+      if (A && B) metricLen = dist3(A, B);
+    }
+
+    // Alternativt: derivedEdgeLengths om den finns (ska matcha dist3(A,B))
+    const derivedLen = derivedMap?.get?.(eid);
     edgesTbl.push({
       eid, kind: e.kind, a: e.a, b: e.b,
-      'metricLen(mm)': round(dMm),
+
+      // från kalkylatorns faktiska koordinater
+      'calc.metricLen(mm)': round(metricLen),
+
+      // extra: derivedEdgeLengths-map (om satt)
+      'calc.derivedLen(mm)': round(derivedLen),
+
+      // användarmått
       'dim.valueMm': round(dim.valueMm),
       'dim.source': dim.source || null,
+      'mode': dim.mode || null,
       'userEditedAt': dim.userEditedAt ?? null,
       'conflict?': !!dim.conflict,
     });
   }
 
+  // — Utskrift
   console.group(`[TRACE] ${title} (edge ${edgeId})`);
-  console.log('Nodes (metric + world):');
+  console.log('Nodes (calc metric + world + meta.metric):');
   console.table(nodesTbl);
-  console.log('Edges (metric length vs dim):');
+  console.log('Edges (calc.metricLen vs dim.valueMm):');
   console.table(edgesTbl);
+
+  // Bonus: snabb överblick om kalkylatorn inte kunde lösa allt
+  if (!metricData) {
+    console.warn('[TRACE] calculator returned null (graph not solvable or missing constraints)');
+  } else {
+    const unplaced = comp.nodes.filter(nid => !metricData.get?.(nid));
+    if (unplaced.length) {
+      console.warn('[TRACE] Unplaced metric nodes:', unplaced);
+    }
+  }
+
   console.groupEnd();
 }
 
-export function dumpPathAndRecency(graph, path, recList, { title = '' } = {}) {
-  const tblPath = [];
-  for (let i=0;i<path.edges.length;i++){
-    const eid = path.edges[i];
-    const e   = graph.getEdge(eid);
-    tblPath.push({
-      i,
-      eid,
-      kind: e.kind,
-      a: path.nodes[i],
-      b: path.nodes[i+1],
-      axis: dominantAxis(vecW(graph, path.nodes[i], path.nodes[i+1])),
-      sign: Math.sign(vecW(graph, path.nodes[i], path.nodes[i+1])[ dominantAxis(vecW(graph, path.nodes[i], path.nodes[i+1])).toLowerCase() ]) || 1
-    });
-  }
-  const tblRec = recList.map(r => ({ type:r.type, eid:r.eid, stamp:r.stamp }));
-  console.group(`[TRACE] ${title}`);
-  console.log('Manhattan path:');
-  console.table(tblPath);
-  console.log('Recency (sorted desc by stamp):');
-  console.table(tblRec);
-  console.groupEnd();
-}
 
 // — helpers —
 function collectComponentFromEdge(graph, startEid) {
