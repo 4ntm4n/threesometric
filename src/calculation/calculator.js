@@ -18,7 +18,7 @@ function sub(a,b){ return {x:a.x-b.x,y:a.y-b.y,z:a.z-b.z}; }
 function mul(a,s){ return {x:a.x*s,y:a.y*s,z:a.z*s}; }
 function dot(a,b){ return a.x*b.x + a.y*b.y + a.z*b.z; }
 function cross(a,b){ return { x:a.y*b.z-a.z*b.y, y:a.z*b.x-a.x*b.z, z:a.x*b.y-a.y*b.x }; }
-function len(a){ return Math.hypot(a.x,a.y,a.z); }
+function len(a){ return Math.hypot(a.x, a.y, a.z); }
 function norm(a){ const L = len(a); return L>EPS ? mul(a,1/L) : v(); }
 function clamp(x,min,max){ return Math.max(min, Math.min(max, x)); }
 function nearZero(x){ return Math.abs(x) < EPS; }
@@ -32,6 +32,19 @@ function rotateAroundAxis(vec, axisUnit, angleRad){
   const term2 = mul(cross(k, vec), s);
   const term3 = mul(k, dot(k, vec) * (1 - c));
   return add(add(term1, term2), term3);
+}
+
+// axishjälpare: projicera v bort från en eller flera axlar (t.ex. normal & runner)
+function projectOntoPlane(vv, removeAxes) {
+  const _dot = (a,b)=>a.x*b.x+a.y*b.y+a.z*b.z;
+  const _norm= (a)=>{ const L=Math.hypot(a.x,a.y,a.z); return L>1e-12?{x:a.x/L,y:a.y/L,z:a.z/L}:null; };
+  let w = { x:vv.x, y:vv.y, z:vv.z };
+  for (const a0 of removeAxes) {
+    const a = _norm(a0); if (!a) continue;
+    const k = _dot(w, a);
+    w = { x: w.x - k*a.x, y: w.y - k*a.y, z: w.z - k*a.z };
+  }
+  return _norm(w);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -80,13 +93,13 @@ function planeNormalFromRef(planeRef, edges, coords){
     let up = { x:0, y:1, z:0 };
     const dotUp = Math.abs(d.x*up.x + d.y*up.y + d.z*up.z);
     if (dotUp > 0.99) {
-        // fallback up-axis om parallellt med globalUp
-        up = Math.abs(d.x) < 0.99 ? { x:1, y:0, z:0 } : { x:0, y:0, z:1 };
+      // fallback up-axis om parallellt med globalUp
+      up = Math.abs(d.x) < 0.99 ? { x:1, y:0, z:0 } : { x:0, y:0, z:1 };
     }
 
     const n = norm(cross(d, up));
     return len(n) > EPS ? n : null;
-    }
+  }
   if (planeRef.type === 'byNormal') {
     const n = planeRef.n || null;
     if (!n) return null;
@@ -124,6 +137,98 @@ function edgeDirectionFromConstraints(graph, edges, coords, fromNodeId, edge) {
     if (len(h) > EPS) hintDir = norm(h);
   }
 
+  // ————————————————————————————————————————————————
+  // T-branch-ortogonalitet i lokal ram kring runnern
+  // Kör endast om denna kant saknar egna constraints (axisLock/parallelTo/perpTo/angleTo).
+  // ————————————————————————————————————————————————
+  try {
+    const fromNode = graph.getNode?.(fromNodeId);
+    const onSeg = fromNode?.meta?.onSegment; // { a, b } om T-nod
+    const noOwnConstraints = !meta.axisLock && !meta.parallelTo && !meta.perpTo && !meta.angleTo;
+
+    if (onSeg && noOwnConstraints && (edge.a === fromNodeId || edge.b === fromNodeId)) {
+      const otherId = (edge.a === fromNodeId) ? edge.b : edge.a;
+
+      // Runner-kant = T-noden kopplad till onSegment-ändarna
+      const isRunnerEdge = (otherId === onSeg.a) || (otherId === onSeg.b);
+
+      if (!isRunnerEdge) {
+        // Lokala hjälpare (retournerar null om degenererat)
+        const EPS2 = 1e-12;
+        const _sub  = (a,b) => ({ x:a.x-b.x, y:a.y-b.y, z:a.z-b.z });
+        const _dot  = (a,b) => a.x*b.x + a.y*b.y + a.z*b.z;
+        const _mul  = (a,s) => ({ x:a.x*s, y:a.y*s, z:a.z*s });
+        const _cross= (a,b) => ({ x:a.y*b.z - a.z*b.y, y:a.z*b.x - a.x*b.z, z:a.x*b.y - a.y*b.x });
+        const _len  = (a)   => Math.hypot(a.x, a.y, a.z);
+        const _norm = (a)   => { const L = _len(a); return (L > EPS2) ? {x:a.x/L,y:a.y/L,z:a.z/L} : null; };
+
+        // 1) Runnerns enhetsriktning u (metric om möjligt, annars world)
+        let u = null;
+        const A = coords?.get?.(onSeg.a), B = coords?.get?.(onSeg.b);
+        if (A && B) u = _norm(_sub(B, A));
+        if (!u) {
+          const Aw = graph.getNodeWorldPos?.(onSeg.a), Bw = graph.getNodeWorldPos?.(onSeg.b);
+          if (Aw && Bw) u = _norm(_sub(Bw, Aw));
+        }
+        if (!u) return null; // kan inte definiera lokal ram
+
+        // 2) Försök låsa branchen till känt plan: n = plan-normal
+        let n = null;
+        const inc = graph.incidentEdges?.(fromNodeId) || [];
+        for (const eInc of inc) {
+          const cm = eInc?.meta?.coplanarWith;
+          const cn = cm?.normal || cm?.n;
+          if (cn) { n = cn; break; }
+        }
+        if (!n) {
+          const pr = fromNode?.meta?.tee?.planeRef;
+          n = pr?.normal || pr?.n || null;
+        }
+
+        let dir = null;
+
+        if (n) {
+          // v ⟂ u och i planet: n × u
+          const v0 = _norm(_cross(n, u)) || _norm(_cross(u, n));
+          if (v0) {
+            dir = v0;
+
+            // ★ Tecken: matcha mot hint projicerad till lokala planet (⊥u och ⊥n)
+            let hintForSign = null;
+            if (hintDir) hintForSign = projectOntoPlane(hintDir, [u, n]);
+            if (hintForSign && _dot(dir, hintForSign) < 0) dir = _mul(dir, -1);
+          }
+        }
+
+        if (!dir && hintDir) {
+          // Ingen plan: använd hint projicerad ⟂ u
+          const proj = _dot(hintDir, u);
+          const v2 = { x: hintDir.x - proj*u.x, y: hintDir.y - proj*u.y, z: hintDir.z - proj*u.z };
+          const vn = _norm(v2);
+          if (vn) dir = vn;
+        }
+
+        if (!dir) {
+          // Sista fallback: välj global axel mest ortogonal mot u och projicera
+          const axes = [ {x:1,y:0,z:0}, {x:0,y:1,z:0}, {x:0,y:0,z:1} ];
+          let best = axes[0], bestScore = -1;
+          for (const a of axes) {
+            const score = 1 - Math.abs(_dot(a, u)); // ju mer ortogonal desto bättre
+            if (score > bestScore) { bestScore = score; best = a; }
+          }
+          const proj = _dot(best, u);
+          const v2 = { x: best.x - proj*u.x, y: best.y - proj*u.y, z: best.z - proj*u.z };
+          const vn = _norm(v2);
+          dir = vn || { x:0, y:0, z:1 };
+        }
+
+        // Kantsida: peka utåt från fromNode
+        if (fromNodeId === edge.b) dir = _mul(dir, -1);
+        return dir; // ← grenriktning i lokal ram: 90° mot runnern
+      }
+    }
+  } catch(_) { /* håll tyst, ingen crash i fallback */ }
+
   // 0) AxisLock (absolut global riktning)
   if (meta.axisLock) {
     let dir =
@@ -150,8 +255,9 @@ function edgeDirectionFromConstraints(graph, edges, coords, fromNodeId, edge) {
     const rad = (meta.angleTo.deg || 0) * Math.PI / 180;
     let dir = norm(rotateAroundAxis(refDir, n, rad));
 
-    // Matcha tecken mot schematisk hint
-    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Matcha tecken mot schematisk hint → projicera till planet
+    let hintForSign = hintDir ? projectOntoPlane(hintDir, [n]) : null;
+    if (hintForSign && dot(dir, hintForSign) < 0) dir = mul(dir, -1);
     // Kantsida
     if (fromNodeId === edge.b) dir = mul(dir, -1);
     return dir;
@@ -166,8 +272,9 @@ function edgeDirectionFromConstraints(graph, edges, coords, fromNodeId, edge) {
     if (nearZero(len(dir))) return null;
     dir = norm(dir);
 
-    // Matcha tecken mot schematisk hint (så vi får rätt "håll")
-    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Matcha tecken mot schematisk hint (projicera till planet)
+    let hintForSign = hintDir ? projectOntoPlane(hintDir, [n]) : null;
+    if (hintForSign && dot(dir, hintForSign) < 0) dir = mul(dir, -1);
     // Kantsida
     if (fromNodeId === edge.b) dir = mul(dir, -1);
     return dir;
@@ -179,8 +286,10 @@ function edgeDirectionFromConstraints(graph, edges, coords, fromNodeId, edge) {
     if (!refDir) return null;
 
     let dir = refDir;
-    // Matcha tecken mot schematisk hint
-    if (hintDir && dot(dir, hintDir) < 0) dir = mul(dir, -1);
+    // Om plan finns, projicera hint till planet innan teckenmatchning
+    let hintForSign = hintDir;
+    if (n && hintDir) hintForSign = projectOntoPlane(hintDir, [n]);
+    if (hintForSign && dot(dir, hintForSign) < 0) dir = mul(dir, -1);
     // Kantsida
     if (fromNodeId === edge.b) dir = mul(dir, -1);
     return dir;
@@ -359,73 +468,72 @@ export function calculateMetricData(graph, opts = {}) {
     }
 
     // 1.5) Placera noder som ligger "på segment" (onSegment) med känt avstånd till A eller B
-   for (const [nid, n] of nodes) {
-     if (coords.has(nid)) continue;
-     const seg = n?.meta?.onSegment;
-     if (!seg) continue;
-     const A = coords.get(seg.a);
-     const B = coords.get(seg.b);
-     if (!A || !B) continue; // vänta tills segmentets ändar är placerade
+    for (const [nid, n] of nodes) {
+      if (coords.has(nid)) continue;
+      const seg = n?.meta?.onSegment;
+      if (!seg) continue;
+      const A = coords.get(seg.a);
+      const B = coords.get(seg.b);
+      if (!A || !B) continue; // vänta tills segmentets ändar är placerade
 
-     // Hitta känt avstånd till A eller B via incident kant
-     const inc = incidentEdgesOf(graph, nid);
-     let L = null, from = null;
-     for (const e of inc) {
-       if (!hasDim(e)) continue;
-       if ((e.a === nid && e.b === seg.a) || (e.b === nid && e.a === seg.a)) { L = e.dim.valueMm; from = 'A'; break; }
-       if ((e.a === nid && e.b === seg.b) || (e.b === nid && e.a === seg.b)) { L = e.dim.valueMm; from = 'B'; break; }
-     }
-     if (L == null) continue;
+      // Hitta känt avstånd till A eller B via incident kant
+      const inc = incidentEdgesOf(graph, nid);
+      let L = null, from = null;
+      for (const e of inc) {
+        if (!hasDim(e)) continue;
+        if ((e.a === nid && e.b === seg.a) || (e.b === nid && e.a === seg.a)) { L = e.dim.valueMm; from = 'A'; break; }
+        if ((e.a === nid && e.b === seg.b) || (e.b === nid && e.a === seg.b)) { L = e.dim.valueMm; from = 'B'; break; }
+      }
+      if (L == null) continue;
 
-     // N = A + normalize(B-A) * L (eller från B)
-     const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
-     const distAB = Math.hypot(dx, dy, dz) || 1;
-     const ux = dx / distAB, uy = dy / distAB, uz = dz / distAB;
-     const pos = (from === 'A')
-       ? { x: A.x + ux * L, y: A.y + uy * L, z: A.z + uz * L }
-       : { x: B.x - ux * L, y: B.y - uy * L, z: B.z - uz * L };
+      // N = A + normalize(B-A) * L (eller från B)
+      const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+      const distAB = Math.hypot(dx, dy, dz) || 1;
+      const ux = dx / distAB, uy = dy / distAB, uz = dz / distAB;
+      const pos = (from === 'A')
+        ? { x: A.x + ux * L, y: A.y + uy * L, z: A.z + uz * L }
+        : { x: B.x - ux * L, y: B.y - uy * L, z: B.z - uz * L };
 
-     coords.set(nid, pos);
-     if (!quiet) console.log('[Calc] Placed node', nid, 'onSegment', seg, 'at', pos);
-     progress = true;
-   }
+      coords.set(nid, pos);
+      if (!quiet) console.log('[Calc] Placed node', nid, 'onSegment', seg, 'at', pos);
+      progress = true;
+    }
 
+    // 1.6) Placera "straight"-noder mellan två placerade grannar via delmått
+    for (const [nid, n] of nodes) {
+      if (coords.has(nid)) continue;
+      const topo = n?.meta?.topo;
+      if (topo !== 'straight') continue;
 
-   // 1.6) Placera "straight"-noder mellan två placerade grannar via delmått
-  for (const [nid, n] of nodes) {
-    if (coords.has(nid)) continue;
-    const topo = n?.meta?.topo;
-    if (topo !== 'straight') continue;
+      // Hämta center-incidenta kanter
+      const incCenter = incidentEdgesOf(graph, nid).filter(e => e?.kind === 'center');
+      if (incCenter.length !== 2) continue; // "straight" bör ha två center-grannar
 
-    // Hämta center-incidenta kanter
-    const incCenter = incidentEdgesOf(graph, nid).filter(e => e?.kind === 'center');
-    if (incCenter.length !== 2) continue; // "straight" bör ha två center-grannar
+      const eA = incCenter[0], eB = incCenter[1];
+      const A = coords.get(eA.a === nid ? eA.b : eA.a);
+      const B = coords.get(eB.a === nid ? eB.b : eB.a);
+      if (!A || !B) continue; // vänta tills båda ändar i linjen är placerade
 
-    const eA = incCenter[0], eB = incCenter[1];
-    const A = coords.get(eA.a === nid ? eA.b : eA.a);
-    const B = coords.get(eB.a === nid ? eB.b : eB.a);
-    if (!A || !B) continue; // vänta tills båda ändar i linjen är placerade
+      // Finns känt delmått till A eller B?
+      let L = null, from = null;
+      if (hasDim(eA)) { L = eA.dim.valueMm; from = 'A'; }
+      if (hasDim(eB)) { L = eB.dim.valueMm; from = from ? from : 'B'; } // om båda finns, ta första
 
-    // Finns känt delmått till A eller B?
-    let L = null, from = null;
-    if (hasDim(eA)) { L = eA.dim.valueMm; from = 'A'; }
-    if (hasDim(eB)) { L = eB.dim.valueMm; from = from ? from : 'B'; } // om båda finns, ta första
+      if (L == null) continue;
 
-    if (L == null) continue;
+      // Placera n på linjen A→B respektive B→A
+      const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
+      const lenAB = Math.hypot(dx, dy, dz) || 1;
+      const ux = dx / lenAB, uy = dy / lenAB, uz = dz / lenAB;
 
-    // Placera n på linjen A→B respektive B→A
-    const dx = B.x - A.x, dy = B.y - A.y, dz = B.z - A.z;
-    const lenAB = Math.hypot(dx, dy, dz) || 1;
-    const ux = dx / lenAB, uy = dy / lenAB, uz = dz / lenAB;
+      const pos = (from === 'A')
+        ? { x: A.x + ux * L, y: A.y + uy * L, z: A.z + uz * L }
+        : { x: B.x - ux * L, y: B.y - uy * L, z: B.z - uz * L };
 
-    const pos = (from === 'A')
-      ? { x: A.x + ux * L, y: A.y + uy * L, z: A.z + uz * L }
-      : { x: B.x - ux * L, y: B.y - uy * L, z: B.z - uz * L };
-
-    coords.set(nid, pos);
-    if (!quiet) console.log('[Calc] Placed node', nid, 'as straight-on-segment between neighbors at', pos);
-    progress = true;
-}
+      coords.set(nid, pos);
+      if (!quiet) console.log('[Calc] Placed node', nid, 'as straight-on-segment between neighbors at', pos);
+      progress = true;
+    }
 
     // 2) Försök placera via TRIANGULERING
     for (const nId of nodes.keys()) {

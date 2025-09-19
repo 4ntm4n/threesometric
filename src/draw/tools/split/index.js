@@ -1,5 +1,5 @@
 // ──────────────────────────────────────────────────────────────────────────────
-// src/draw/tools/split/index.js tidigare split(splitEdge.js)
+// src/draw/tools/split/index.js
 // Delar en center-edge vid world-koord (eller param t) och skapar en "kedja"
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -13,132 +13,111 @@ export function splitEdge(graph, edgeId, opts = {}) {
   //   onEdgeAdded?: (edgeId)=>void
   //   onNodeCreated?: (nodeId)=>void
   //   chainIdFactory?: (oldEdge)=>string
+  //   mergeEps?: number
   //
   // return:
   //   { ok, reason?, newNodeId?, leftEdgeId?, rightEdgeId?, removedEdgeId?, chainId?, t, pos }
 
   const e = graph.getEdge(edgeId);
-  if (!e) return { ok:false, reason:'no_edge' };
+  if (!e) return { ok: false, reason: 'no_edge' };
 
   const enforceCenterOnly = opts.enforceCenterOnly !== false;
   if (enforceCenterOnly && e.kind !== 'center') {
-    return { ok:false, reason:'only_center_edges_can_be_split' };
+    return { ok: false, reason: 'only_center_edges_can_be_split' };
   }
 
   // Försök hämta ändpunkter (kan saknas innan metrisk placering)
   const pa = graph.getNodeWorldPos?.(e.a) || graph.getNodeBasePos?.(e.a) || null;
   const pb = graph.getNodeWorldPos?.(e.b) || graph.getNodeBasePos?.(e.b) || null;
 
-  function lerp(a,b,t){ return { x:a.x+(b.x-a.x)*t, y:a.y+(b.y-a.y)*t, z:a.z+(b.z-a.z)*t }; }
+  const lerp = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t });
 
   let t = (typeof opts.t === 'number') ? opts.t : null;
-  let tClamped = null;             // <-- alltid definierad
+  let tClamped = null;
   let pSplit = null;
 
   if (pa && pb) {
-    // Vanliga vägen: projektera på AB
+    // Projektera på AB
     const ab = { x: pb.x - pa.x, y: pb.y - pa.y, z: pb.z - pa.z };
-    const abLen2 = ab.x*ab.x + ab.y*ab.y + ab.z*ab.z;
-    if (abLen2 <= 1e-12) return { ok:false, reason:'degenerate_edge' };
+    const abLen2 = ab.x * ab.x + ab.y * ab.y + ab.z * ab.z;
+    if (abLen2 <= 1e-12) return { ok: false, reason: 'degenerate_edge' };
 
     if (t == null) {
       const p = opts.hitWorldPos;
-      if (!p) return { ok:false, reason:'need_hitWorldPos_or_t' };
+      if (!p) return { ok: false, reason: 'need_hitWorldPos_or_t' };
       const ap = { x: p.x - pa.x, y: p.y - pa.y, z: p.z - pa.z };
-      const dot = ap.x*ab.x + ap.y*ab.y + ap.z*ab.z;
+      const dot = ap.x * ab.x + ap.y * ab.y + ap.z * ab.z;
       t = dot / abLen2; // oklampad projektion
     }
 
     const clampEps = (typeof opts.clampEps === 'number') ? opts.clampEps : 1e-6;
     tClamped = Math.max(0, Math.min(1, t));
-    if (tClamped <= clampEps) {
-      return { ok:false, reason:'too_close_to_a', snapTo:e.a, t:0 };
-    }
-    if (tClamped >= 1 - clampEps) {
-      return { ok:false, reason:'too_close_to_b', snapTo:e.b, t:1 };
-    }
+    if (tClamped <= clampEps)   return { ok: false, reason: 'too_close_to_a', snapTo: e.a, t: 0 };
+    if (tClamped >= 1 - clampEps) return { ok: false, reason: 'too_close_to_b', snapTo: e.b, t: 1 };
+
     pSplit = lerp(pa, pb, tClamped);
   } else {
     // FALLBACK: saknar world-coords för A/B → använd klickpunkten direkt
-    if (!opts.hitWorldPos) {
-      return { ok:false, reason:'need_hitWorldPos_when_no_world_endpoints' };
-    }
+    if (!opts.hitWorldPos) return { ok: false, reason: 'need_hitWorldPos_when_no_world_endpoints' };
     pSplit = { x: opts.hitWorldPos.x, y: opts.hitWorldPos.y, z: opts.hitWorldPos.z };
-    tClamped = null; // vi kan inte beräkna t utan world-coords
+    tClamped = null; // kan inte beräkna t utan world-coords
   }
 
-  
-  // 1) Skapa eller återanvänd nod vid splitpunkten
+  // 1) Skapa eller återanvänd nod vid splitpunkten (undvik dubletter)
   const mergeEps = (typeof opts.mergeEps === 'number') ? opts.mergeEps : 1e-6;
-
-  // Om det redan finns en nod väldigt nära splitpunkten → återanvänd den
   let existing = null;
   if (typeof graph.findNodeNear === 'function') {
     existing = graph.findNodeNear(pSplit, mergeEps);
-    // ignorera om "befintlig" är en av ändnoderna (det fallet hanteras tidigare via too_close_to_a/b)
-    if (existing && (existing.id === e.a || existing.id === e.b)) {
-      existing = null;
-    }
+    if (existing && (existing.id === e.a || existing.id === e.b)) existing = null;
   }
 
   let newNodeId;
   if (existing) {
-    // Återanvänd
     newNodeId = existing.id;
-
-    // Se till att onSegment-meta finns (utan att trampa sönder befintlig meta)
-    try {
-      const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
-      if (!prevMeta.onSegment) {
-        const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
-        if (typeof graph.setNodeMeta === 'function') {
-          graph.setNodeMeta(newNodeId, nextMeta);
-        } else {
-          const n = graph.getNode?.(newNodeId);
-          if (n) n.meta = nextMeta;
-        }
-      }
-    } catch { /* ignore */ }
-
-    // Notifiera UI-krok om du vill
-    if (typeof opts.onNodeCreated === 'function') opts.onNodeCreated(newNodeId);
   } else {
-    // Skapa ny nod
     const nNew = graph.addNodeAt(pSplit);
     newNodeId = nNew.id;
     if (typeof opts.onNodeCreated === 'function') opts.onNodeCreated(newNodeId);
-
-    // Sätt onSegment-meta på den nya noden
-    try {
-      const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
-      const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
-      if (typeof graph.setNodeMeta === 'function') {
-        graph.setNodeMeta(newNodeId, nextMeta);
-      } else {
-        const n = graph.getNode?.(newNodeId);
-        if (n) n.meta = nextMeta;
-      }
-    } catch { /* ignore */ }
   }
 
-    // Markera att nya noden ligger på metriska segmentet A–B
-    try {
-      const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
+  // Sätt/behåll onSegment på T-noden (utan att skriva över annan meta)
+  try {
+    const prevMeta = graph.getNode?.(newNodeId)?.meta || {};
+    if (!prevMeta.onSegment) {
       const nextMeta = { ...prevMeta, onSegment: { a: e.a, b: e.b } };
-      if (typeof graph.setNodeMeta === 'function') {
-        graph.setNodeMeta(newNodeId, nextMeta);
-      } else {
-        const n = graph.getNode?.(newNodeId);
-        if (n) n.meta = nextMeta;
-      }
-    } catch { /* ignore */ }
+      if (typeof graph.setNodeMeta === 'function') graph.setNodeMeta(newNodeId, nextMeta);
+      else { const n = graph.getNode?.(newNodeId); if (n) n.meta = nextMeta; }
+    }
+  } catch { /* ignore */ }
 
-  // Bevara ev. spec från originalkanten
-  const spec = graph.getEdgeSpec?.(edgeId);
-
-  // Dim-mode från original om den fanns (t.ex. 'aligned')
+  // Bevara spec och dim-mode från original
+  const spec   = graph.getEdgeSpec?.(edgeId);
   const oldDim = graph.getEdgeDimension?.(edgeId);
-  const dimMode = oldDim?.mode || 'aligned';
+  const dimMode = (oldDim?.mode ?? e.dim?.mode ?? 'aligned');
+
+  // ── plocka constraints från originalet (innan removeEdge) ───────────────────
+  const pickConstraintMeta = (m = {}) => {
+    const out = {};
+    if (m.axisLock)      out.axisLock = m.axisLock;                 // 'X' | 'Y' | 'Z'
+    if (m.parallelTo)    out.parallelTo = { ...m.parallelTo };      // { ref }
+    if (m.perpTo)        out.perpTo     = { ...m.perpTo };          // { ref }
+    if (m.angleTo)       out.angleTo    = { ...m.angleTo };         // { ref, deg }
+    if (m.coplanarWith)  out.coplanarWith = { ...m.coplanarWith };  // { normal|n: {x,y,z}, ... }
+    return out;
+  };
+
+  const srcMeta     = (typeof graph.getEdgeMeta === 'function') ? (graph.getEdgeMeta(edgeId) || {}) : (e.meta || {});
+  let   constraints = pickConstraintMeta(srcMeta);
+
+  // Fallback: om originalet saknar alla constraints → syntetisera axisLock från world-riktningen
+  if (!constraints.axisLock && !constraints.parallelTo && !constraints.perpTo && !constraints.angleTo && !constraints.coplanarWith) {
+    if (pa && pb) {
+      const ab = { x: pb.x - pa.x, y: pb.y - pa.y, z: pb.z - pa.z };
+      const ax = Math.abs(ab.x), ay = Math.abs(ab.y), az = Math.abs(ab.z);
+      constraints.axisLock = (ay >= ax && ay >= az) ? 'Y' : (az >= ax && az >= ay) ? 'Z' : 'X';
+      // console.debug('[Split] synth axisLock', constraints.axisLock, 'for', edgeId);
+    }
+  }
 
   // Kedje-id
   const oldMeta = graph.getEdgeMeta?.(edgeId) || {};
@@ -150,7 +129,7 @@ export function splitEdge(graph, edgeId, opts = {}) {
   graph.removeEdge(edgeId);
   if (typeof opts.onEdgeRemoved === 'function') opts.onEdgeRemoved(edgeId);
 
-  // 3) Skapa två nya kanter
+  // 3) Skapa två nya kanter (växer utåt från split-noden)
   const left  = graph.addEdge(e.a, newNodeId, e.kind);
   const right = graph.addEdge(newNodeId, e.b, e.kind);
 
@@ -160,20 +139,37 @@ export function splitEdge(graph, edgeId, opts = {}) {
     graph.setEdgeSpec?.(right.id, spec);
   }
 
-  // Kedje-meta
-  graph.setEdgeMeta?.(left.id,  { chainId, splitParentId: e.id });
-  graph.setEdgeMeta?.(right.id, { chainId, splitParentId: e.id });
+  // ── constraints per halva ───────────────────────────────────────────────────
+  let constraintsLeft  = { ...constraints };
+  let constraintsRight = { ...constraints };
 
-  // Dim: nollställ per segment som derived/chain (autosolver tar totalen sen)
+  const hadDirectional = !!(constraints.parallelTo || constraints.perpTo || constraints.angleTo);
+
+  // Om originalet var "riktande" (angleTo/perpTo/parallelTo) men inte axisLock,
+  // låt onSegment styra och gör halvorna kolinära i samma plan.
+  if (!constraints.axisLock && hadDirectional) {
+    const planeOnly = constraints.coplanarWith ? { coplanarWith: { ...constraints.coplanarWith } } : {};
+    constraintsLeft  = { ...planeOnly };
+    constraintsRight = { ...planeOnly, parallelTo: { ref: left.id } };
+  }
+
+  // skriv meta (constraints per halva + kedje-meta)
+  const chainMeta = { chainId, splitParentId: e.id };
+  if (typeof graph.setEdgeMeta === 'function') {
+    graph.setEdgeMeta(left.id,  { ...constraintsLeft,  ...chainMeta });
+    graph.setEdgeMeta(right.id, { ...constraintsRight, ...chainMeta });
+  }
+
+  // dimensioner: låt autosolver härleda (user sätter ev. en av dem senare)
   graph.setEdgeDimension?.(
     left.id,
-    { valueMm: null, mode: dimMode, source:'derived', derivedFrom:{ type:'split', parentEdgeId: e.id, chainId } },
-    { silent:true }
+    { valueMm: null, mode: dimMode, source: 'derived', derivedFrom: { type: 'split', parentEdgeId: e.id, chainId } },
+    { silent: true }
   );
   graph.setEdgeDimension?.(
     right.id,
-    { valueMm: null, mode: dimMode, source:'derived', derivedFrom:{ type:'split', parentEdgeId: e.id, chainId } },
-    { silent:true }
+    { valueMm: null, mode: dimMode, source: 'derived', derivedFrom: { type: 'split', parentEdgeId: e.id, chainId } },
+    { silent: true }
   );
 
   if (typeof opts.onEdgeAdded === 'function') {
@@ -196,4 +192,3 @@ export function splitEdge(graph, edgeId, opts = {}) {
     pos: pSplit,
   };
 }
-
